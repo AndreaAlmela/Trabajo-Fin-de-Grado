@@ -1,1 +1,0 @@
-RFIguras de resultados

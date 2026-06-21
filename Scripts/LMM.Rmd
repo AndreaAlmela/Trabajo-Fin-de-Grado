@@ -1,0 +1,1601 @@
+---
+title: "LMMs"
+author: "Andrea"
+date: "2026-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## CARGA LIBRERÍAS Y DATOS
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(pheatmap)
+library(factoextra)
+library(decoupleR)
+```
+
+
+Actividades TFs de  VIPER:
+```{r}
+TF_activity_auto <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/auto_TF_score_collectri.csv")
+TF_activity_mono <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/mono_TF_score_collectri.csv")
+```
+
+
+Cargamos los TFs diferencialmente activos obtenidos con msVIPER:
+
+```{r}
+TF_msVIPER_auto <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/msViper_auto_TFs.csv")
+TF_msVIPER_mono <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/msViper_mono_TFs.csv")
+
+```
+
+# PREPARACIÓN DE DATOS
+
+Unión de las matrices de actividades de VIPER en una única matriz
+
+```{r}
+TF_activity_auto <- as.data.frame(TF_activity_auto)
+rownames(TF_activity_auto) <- TF_activity_auto$X
+TF_activity_auto$X <- NULL
+TF_activity_auto[] <- lapply(TF_activity_auto, as.numeric)
+TF_activity_auto <- as.matrix(TF_activity_auto)
+```
+
+```{r}
+TF_activity_mono <- as.data.frame(TF_activity_mono)
+rownames(TF_activity_mono) <- TF_activity_mono$X
+TF_activity_mono$X <- NULL
+TF_activity_mono[] <- lapply(TF_activity_mono, as.numeric)
+TF_activity_mono <- as.matrix(TF_activity_mono)
+```
+
+Nos quedamos con los TFs presentes en ambas matrices VIPER y unimos las dos condiciones.
+
+```{r}
+common_tfs <- intersect(rownames(TF_activity_auto),
+                        rownames(TF_activity_mono))
+
+TF_score_collectri <- cbind(
+  TF_activity_auto[common_tfs, , drop = FALSE],
+  TF_activity_mono[common_tfs, , drop = FALSE]
+)
+
+dim(TF_score_collectri)
+head(TF_score_collectri)
+
+all(rownames(TF_activity_auto[common_tfs, , drop = FALSE]) == 
+      rownames(TF_activity_mono[common_tfs, , drop = FALSE]))
+```
+
+Obtemos ahora la lista de los TFs DA de msVIPER (UNIÓN entre autologous y monoculture)
+
+```{r}
+TFs_msViper <- unique(c(TF_msVIPER_auto$x, TF_msVIPER_mono$x))
+length(TFs_msViper)
+```
+
+Y ahora filtramos los TFs DA en la matriz de actividades para obtener una matriz con las actividades de los TFs diferencialmente activos:
+
+```{r}
+reg_filt <- TF_score_collectri[rownames(TF_score_collectri) %in% TFs_msViper, ]
+head(reg_filt)
+dim(reg_filt)
+```
+```{r}
+setdiff(TFs_msViper, rownames(TF_score_collectri))
+```
+```{r}
+tfs_auto <- rownames(TF_activity_auto)
+tfs_mono <- rownames(TF_activity_mono)
+
+common_tfs <- intersect(tfs_auto, tfs_mono)
+union_tfs <- union(tfs_auto, tfs_mono)
+
+cat("TFs DA msVIPER:", length(TFs_msViper), "\n")
+cat("TFs en VIPER autologous:", length(tfs_auto), "\n")
+cat("TFs en VIPER monoculture:", length(tfs_mono), "\n")
+cat("TFs comunes en ambas matrices VIPER:", length(common_tfs), "\n")
+cat("TFs en la unión de ambas matrices VIPER:", length(union_tfs), "\n")
+cat("TFs DA presentes en ambas matrices VIPER:", length(intersect(TFs_msViper, common_tfs)), "\n")
+cat("TFs DA presentes en al menos una matriz VIPER:", length(intersect(TFs_msViper, union_tfs)), "\n")
+```
+
+```{r}
+presencia_TFs <- tibble(
+  TF = TFs_msViper,
+  en_auto = TF %in% tfs_auto,
+  en_mono = TF %in% tfs_mono,
+  en_ambas = TF %in% common_tfs,
+  en_alguna = TF %in% union_tfs
+)
+
+presencia_TFs %>%
+  filter(!en_ambas)
+```
+
+# FORMATO LARGO Y METADATOS
+
+```{r}
+reg_filt <- as.data.frame(reg_filt)
+
+df_long <- reg_filt %>%
+  rownames_to_column("TF") %>%
+  pivot_longer(
+    cols = -TF,
+    names_to = "sample",
+    values_to = "value"
+  )
+```
+
+```{r}
+sample_names <- colnames(reg_filt)
+
+meta <- data.frame(sample = sample_names) %>%
+  mutate(
+    condition = ifelse(sample %>% str_detect("auto"), "autologous", "monoculture"),
+    time      = str_extract(sample, "D\\d+"),          # D1, D4, D8, D11, D14
+    time_num  = as.numeric(str_remove(time, "D")),     
+    patient   = str_extract(sample, "p\\d+"),          # p1, p2, p3 
+    replicate = str_extract(sample, "rep\\d+")         # rep1, rep2
+  )
+
+meta$time <- factor(meta$time, levels = c("D1", "D4", "D8", "D11", "D14"))
+
+meta <- meta %>%
+  mutate(
+    condition = factor(condition, levels = c("monoculture", "autologous")),
+    patient = factor(patient),
+    replicate = factor(replicate),
+
+    patient_condition_replicate = interaction(
+      patient,
+      condition,
+      replicate,
+      sep = "_",
+      drop = TRUE),
+
+    replicate_new = paste0("rep", as.numeric(factor(patient_condition_replicate))),
+    replicate_new = factor(replicate_new)
+  )
+meta
+```
+
+Unimos con el metadata que es lo que necesita lmer:
+```{r}
+df_long <- as.data.frame(reg_filt) %>%
+  rownames_to_column("TF") %>%
+  pivot_longer(
+    cols = -TF,
+    names_to = "sample",
+    values_to = "value"
+  )
+
+df_model <- df_long %>%
+  left_join(meta, by = "sample") %>%
+  mutate(
+    TF = factor(TF)
+  )
+
+df_model
+```
+
+Y escalamos:
+
+```{r}
+df_model <- df_model %>%
+  group_by(TF) %>%
+  mutate(
+    value_scaled = as.numeric(scale(value))
+  ) %>%
+  ungroup()
+```
+
+
+Obtenemos 12 réplicas distintas porque tenemos 3 pacientes x 2 condiciones x 2 réplicas = 12 series temporales
+
+
+
+# PIPELINE PARA ESCOGER MODELO
+
+Se prueban tres estructuras para cada TF:
+
+- intercepto aleatorio por paciente
+- intercepto aleatorio por réplica temporal
+- intercepto aleatorio por paciente y por réplica
+
+```{r}
+# Lista de TFs que vamos a modelar
+DA_TFs <- unique(df_model$TF)
+length(DA_TFs)
+```
+
+
+Creamos un dataframe vacío para guardar los resultados:
+```{r}
+results_model <- data.frame()
+```
+
+
+Probamos para un solo TF:
+
+```{r}
+tf <- DA_TFs[1]
+
+df_tf <- df_model %>%
+  filter(TF == tf) %>%
+  drop_na(value_scaled, time_num, condition, patient, replicate_new)
+
+head(df_tf)
+```
+
+
+Ajustamos ahora los tres modelos para este TF:
+
+```{r}
+m_patient <- lmer(
+  value_scaled ~ poly(time_num, 4) * condition +
+    (1 | patient),
+  data = df_tf,
+  REML = FALSE
+)
+```
+
+```{r}
+m_replicate <- lmer(
+  value_scaled ~ poly(time_num, 4) * condition +
+    (1 | replicate_new),
+  data = df_tf,
+  REML = FALSE
+)
+```
+
+```{r}
+m_patient_replicate <- lmer(
+  value_scaled ~ poly(time_num, 4) * condition +
+    (1 | patient) +
+    (1 | replicate_new),
+  data = df_tf,
+  REML = FALSE
+)
+```
+
+```{r}
+AIC(m_patient, m_replicate, m_patient_replicate)
+```
+
+
+```{r}
+BIC(m_patient, m_replicate, m_patient_replicate)
+```
+
+
+```{r}
+aic_values <- c(
+  patient = AIC(m_patient),
+  replicate = AIC(m_replicate),
+  patient_replicate = AIC(m_patient_replicate)
+)
+
+best_model <- names(which.min(aic_values))
+best_model
+```
+
+
+Hacemos ahora el bucle para todos los TFs:
+
+```{r}
+results_model <- data.frame()
+
+for (tf in DA_TFs) {
+  
+  
+  # Filtramos los datos del TF actual
+  df_tf <- df_model %>%
+    filter(TF == tf) %>%
+    drop_na(value_scaled, time_num, condition, patient, replicate_new)
+  
+  # Si por algún motivo hay pocas observaciones, saltamos ese TF
+  if (nrow(df_tf) < 10) {
+    
+    results_model <- rbind(
+      results_model,
+      data.frame(
+        TF = as.character(tf),
+        AIC_patient = NA,
+        AIC_replicate = NA,
+        AIC_patient_replicate = NA,
+        BIC_patient = NA,
+        BIC_replicate = NA,
+        BIC_patient_replicate = NA,
+        logLik_patient = NA,
+        logLik_replicate = NA,
+        logLik_patient_replicate = NA,
+        singular_patient = NA,
+        singular_replicate = NA,
+        singular_patient_replicate = NA,
+        best_model = NA,
+        status = "too_few_observations"
+      )
+    )
+    
+    next
+  }
+  
+  # Ajustamos los modelos con tryCatch para que el bucle no se pare si un TF falla
+  modelos <- tryCatch({
+    
+    m_patient <- lmer(
+      value_scaled ~ poly(time_num, 4) * condition +
+        (1 | patient),
+      data = df_tf,
+      REML = FALSE
+    )
+    
+    m_replicate <- lmer(
+      value_scaled ~ poly(time_num, 4) * condition +
+        (1 | replicate_new),
+      data = df_tf,
+      REML = FALSE
+    )
+    
+    m_patient_replicate <- lmer(
+      value_scaled ~ poly(time_num, 4) * condition +
+        (1 | patient) +
+        (1 | replicate_new),
+      data = df_tf,
+      REML = FALSE
+    )
+    
+    list(
+      patient = m_patient,
+      replicate = m_replicate,
+      patient_replicate = m_patient_replicate
+    )
+    
+  }, error = function(e) {
+    cat("Error en", as.character(tf), ":", e$message, "\n")
+    return(NULL)
+  })
+  
+  # Si ha fallado algún modelo, guardamos NA
+  if (is.null(modelos)) {
+    
+    results_model <- rbind(
+      results_model,
+      data.frame(
+        TF = as.character(tf),
+        AIC_patient = NA,
+        AIC_replicate = NA,
+        AIC_patient_replicate = NA,
+        BIC_patient = NA,
+        BIC_replicate = NA,
+        BIC_patient_replicate = NA,
+        logLik_patient = NA,
+        logLik_replicate = NA,
+        logLik_patient_replicate = NA,
+        singular_patient = NA,
+        singular_replicate = NA,
+        singular_patient_replicate = NA,
+        best_model = NA,
+        status = "error"
+      )
+    )
+    
+    next
+  }
+  
+  # Extraemos cada modelo
+  m_patient <- modelos$patient
+  m_replicate <- modelos$replicate
+  m_patient_replicate <- modelos$patient_replicate
+  
+  # Elegimos el mejor por AIC
+  aic_values <- c(
+    patient = AIC(m_patient),
+    replicate = AIC(m_replicate),
+    patient_replicate = AIC(m_patient_replicate)
+  )
+  
+  best_model <- names(which.min(aic_values))
+  
+  # Guardamos los resultados
+  results_model <- rbind(
+    results_model,
+    data.frame(
+      TF = as.character(tf),
+      
+      AIC_patient = AIC(m_patient),
+      AIC_replicate = AIC(m_replicate),
+      AIC_patient_replicate = AIC(m_patient_replicate),
+      
+      BIC_patient = BIC(m_patient),
+      BIC_replicate = BIC(m_replicate),
+      BIC_patient_replicate = BIC(m_patient_replicate),
+      
+      logLik_patient = as.numeric(logLik(m_patient)),
+      logLik_replicate = as.numeric(logLik(m_replicate)),
+      logLik_patient_replicate = as.numeric(logLik(m_patient_replicate)),
+      
+      singular_patient = isSingular(m_patient),
+      singular_replicate = isSingular(m_replicate),
+      singular_patient_replicate = isSingular(m_patient_replicate),
+      
+      best_model = best_model,
+      status = "ok"
+    )
+  )
+}
+```
+
+
+Miramos si ha funcionado para todos los modelos:
+```{r}
+results_model %>%
+  count(status)
+```
+
+Miramos qué modelo ha sido elegido más veces
+```{r}
+results_model %>%
+  count(best_model) %>%
+  arrange(desc(n))
+```
+
+Y miramos si hay muchos modelos singulares:
+```{r}
+results_model %>%
+  summarise(
+    singular_patient = sum(singular_patient, na.rm = TRUE),
+    singular_replicate = sum(singular_replicate, na.rm = TRUE),
+    singular_patient_replicate = sum(singular_patient_replicate, na.rm = TRUE)
+  )
+```
+
+```{r}
+results_model %>%
+  arrange(best_model, AIC_patient_replicate) %>%
+  head(20)
+```
+
+```{r}
+results_model <- results_model %>%
+  mutate(
+    delta_AIC_replicate = AIC_replicate - AIC_patient,
+    delta_AIC_patient_replicate = AIC_patient_replicate - AIC_patient
+  )
+
+summary(results_model$delta_AIC_patient_replicate)
+summary(results_model$delta_AIC_replicate)
+```
+
+```{r}
+tabla_efectos_aleatorios <- data.frame(
+  estructura = c("Paciente", "Réplica", "Paciente + réplica"),
+  seleccionados_AIC = c(
+    sum(results_model$best_model == "patient", na.rm = TRUE),
+    sum(results_model$best_model == "replicate", na.rm = TRUE),
+    sum(results_model$best_model == "patient_replicate", na.rm = TRUE)
+  ),
+  ajustes_singulares = c(
+    sum(results_model$singular_patient, na.rm = TRUE),
+    sum(results_model$singular_replicate, na.rm = TRUE),
+    sum(results_model$singular_patient_replicate, na.rm = TRUE)
+  )
+)
+
+tabla_efectos_aleatorios
+```
+
+
+# MODELO FINAL
+
+A partir de la comparación anterior, se selecciona una estructura común para todos los TFs. En este caso se utiliza un intercepto aleatorio por paciente, ya que permite incorporar la variabilidad entre pacientes manteniendo un modelo sencillo y estable.
+
+```{r}
+coef_results <- list()
+model_status <- data.frame()
+
+for (tf in DA_TFs) {
+  
+  df_tf <- df_model %>%
+    filter(TF == tf) %>%
+    drop_na(value_scaled, time_num, condition, patient) %>%
+    droplevels()
+  
+  modelo <- tryCatch({
+    lmerTest::lmer(
+      value_scaled ~ poly(time_num, 4) * condition + (1 | patient),
+      data = df_tf,
+      REML = FALSE
+    )
+    
+  }, error = function(e) {
+    
+    return(NULL)
+    
+  })
+  
+  if (is.null(modelo)) {
+    
+    model_status <- rbind(
+      model_status,
+      data.frame(
+        TF = as.character(tf),
+        status = "error",
+        singular = NA
+      )
+    )
+    
+    next
+  }
+  
+  # Obtenemos los coeficientes del modelo y el p-valor para cada TF
+  
+  coef_tab <- summary(modelo)$coefficients
+  
+  coef_df <- data.frame(
+  TF = as.character(tf),
+  term = rownames(coef_tab),
+  estimate = as.numeric(coef_tab[, "Estimate"]),
+  pvalue = as.numeric(coef_tab[, "Pr(>|t|)"]),
+  row.names = NULL
+)
+  
+  coef_results[[as.character(tf)]] <- coef_df
+  
+  model_status <- rbind(
+    model_status,
+    data.frame(
+      TF = as.character(tf),
+      status = "ok",
+      singular = isSingular(modelo)
+    )
+  )
+}
+```
+
+
+Unimos ahora los coeficientes en una tabla
+```{r}
+coef_results_df <- bind_rows(coef_results)
+model_status_df <- bind_rows(model_status)
+head(coef_results_df)
+head(model_status_df)
+```
+
+
+Y filtramos los coeficientes por significancia, es decir, si p-value es significativo conservamos el coeficiente, si no lo sustituimos por 0.
+
+```{r}
+alpha_value <- 0.05
+
+coef_results_df <- coef_results_df %>%
+  mutate(
+    significant = !is.na(pvalue) & pvalue < alpha_value,
+    estimate_filtered = ifelse(significant, estimate, 0)
+  )
+
+head(coef_results_df)
+```
+
+```{r}
+library(dplyr)
+
+tabla_coef_significativos <- coef_results_df %>%
+  mutate(
+    term_clean = case_when(
+      term == "(Intercept)" ~ "Intercepto",
+      term == "poly(time_num, 4)1" ~ "Tiempo 1",
+      term == "poly(time_num, 4)2" ~ "Tiempo 2",
+      term == "poly(time_num, 4)3" ~ "Tiempo 3",
+      term == "poly(time_num, 4)4" ~ "Tiempo 4",
+      term == "conditionautologous" ~ "Condición autologous",
+      term == "poly(time_num, 4)1:conditionautologous" ~ "Tiempo 1 x autologous",
+      term == "poly(time_num, 4)2:conditionautologous" ~ "Tiempo 2 x autologous",
+      term == "poly(time_num, 4)3:conditionautologous" ~ "Tiempo 3 x autologous",
+      term == "poly(time_num, 4)4:conditionautologous" ~ "Tiempo 4 x autologous",
+      term == "conditionautologous:poly(time_num, 4)1" ~ "Tiempo 1 x autologous",
+      term == "conditionautologous:poly(time_num, 4)2" ~ "Tiempo 2 x autologous",
+      term == "conditionautologous:poly(time_num, 4)3" ~ "Tiempo 3 x autologous",
+      term == "conditionautologous:poly(time_num, 4)4" ~ "Tiempo 4 x autologous",
+      TRUE ~ term
+    )
+  ) %>%
+  group_by(term_clean) %>%
+  summarise(
+    n_TFs_significativos = sum(significant, na.rm = TRUE),
+    porcentaje_TFs = round(100 * n_TFs_significativos / n_distinct(coef_results_df$TF), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_TFs_significativos))
+
+tabla_coef_significativos
+```
+
+
+
+```{r}
+# Vemos que TFs tienen más términos significativos en el modelo
+
+tabla_tfs_mas_significativos <- coef_results_df %>%
+  group_by(TF) %>%
+  summarise(
+    n_coef_significativos = sum(significant, na.rm = TRUE),
+    min_pvalue = min(pvalue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_coef_significativos), min_pvalue)
+
+head(tabla_tfs_mas_significativos, 20)
+```
+
+# COEFICIENTES POR CONDICIÓN
+
+Como `monoculture` es la condición de referencia, sus coeficientes son los términos base. Los coeficientes de `autologous` se obtienen sumando el efecto de condición y las interacciones con el tiempo.
+```{r}
+coef_wide <- coef_results_df %>%
+  dplyr::select(TF, term, estimate_filtered) %>%
+  tidyr::pivot_wider(
+    names_from = term,
+    values_from = estimate_filtered,
+    values_fill = 0
+  )
+
+head(coef_wide)
+```
+
+Ahora construimos las tablas de coeficientes por condición:
+
+```{r}
+# coeficientes de monoculture
+coef_mono <- data.frame(
+  TF = coef_wide$TF,
+  mono_b0 = coef_wide$`(Intercept)`,
+  mono_b1 = coef_wide$`poly(time_num, 4)1`,
+  mono_b2 = coef_wide$`poly(time_num, 4)2`,
+  mono_b3 = coef_wide$`poly(time_num, 4)3`,
+  mono_b4 = coef_wide$`poly(time_num, 4)4`
+)
+
+head(coef_mono)
+```
+
+```{r}
+# coeficientes de autologous
+coef_auto <- data.frame(
+  TF = coef_wide$TF,
+  
+  auto_b0 = coef_wide$`(Intercept)` + coef_wide$conditionautologous,
+  auto_b1 = coef_wide$`poly(time_num, 4)1` + coef_wide$`poly(time_num, 4)1:conditionautologous`,
+  auto_b2 = coef_wide$`poly(time_num, 4)2` + coef_wide$`poly(time_num, 4)2:conditionautologous`,
+  auto_b3 = coef_wide$`poly(time_num, 4)3` + coef_wide$`poly(time_num, 4)3:conditionautologous`,
+  auto_b4 = coef_wide$`poly(time_num, 4)4` + coef_wide$`poly(time_num, 4)4:conditionautologous`
+)
+
+head(coef_auto)
+```
+
+```{r}
+# Unimos las columnas en un único dataset con todos los coeficientes
+coef_by_condition <- coef_mono %>%
+  left_join(coef_auto, by = "TF")
+
+head(coef_by_condition)
+```
+Como la condición de referencia del modelo es `monoculture`, sus coeficientes corresponden directamente a los términos base del modelo. En cambio, los coeficientes de `autologous` se obtienen sumando a esos términos base el efecto adicional asociado a la condición `autologous` y a sus interacciones con el tiempo.
+
+
+
+# TRAYECTORIAS TEMPORALES TFs PRIORITARIOS
+
+
+```{r}
+tfs_prioritarios <- c("BHLHE40", "SP1", "NFKB", "TP53", "PRDM1", "E2F1")
+tfs_disponibles <- intersect(tfs_prioritarios, unique(df_model$TF))
+
+
+df_trayectorias <- df_model %>%
+  filter(TF %in% tfs_prioritarios)
+
+grafico_trayectorias <- ggplot(
+  df_trayectorias,
+  aes(
+    x = time_num,
+    y = value_scaled,
+    group = interaction(condition, patient, replicate),
+    color = condition
+  )
+) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(aes(group = condition), method = "loess", se = TRUE, linewidth = 1.1) +
+  facet_wrap(~ TF, scales = "free_y") +
+  labs(
+    title = "Trayectorias temporales de actividad reguladora",
+    x = "Tiempo",
+    y = "Actividad reguladora escalada",
+    color = "Condición"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 13),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 13),
+    strip.text = element_text(size = 14, face = "bold")
+  )
+
+grafico_trayectorias
+```
+```{r}
+ggsave(
+  filename = "trayectorias_temporales_TFs.png",
+  plot = grafico_trayectorias,
+  width = 14,
+  height = 10,
+  dpi = 300
+)
+```
+
+
+
+# CLUSTERING DE TFs POR CONDICIÓN
+
+Preparamos las matrices para el clustering
+
+```{r}
+# Pasamos a matriz numérica para clustering
+mat_auto <- coef_auto %>%
+  tibble::column_to_rownames("TF") %>%
+  as.matrix()
+
+mat_mono <- coef_mono %>%
+  tibble::column_to_rownames("TF") %>%
+  as.matrix()
+```
+
+```{r}
+mat_auto_scaled <- scale(mat_auto)
+mat_mono_scaled <- scale(mat_mono)
+```
+
+```{r}
+mat_auto_scaled[is.na(mat_auto_scaled)] <- 0
+mat_mono_scaled[is.na(mat_mono_scaled)] <- 0
+```
+
+
+```{r}
+hc_auto <- hclust(dist(mat_auto_scaled, method = "euclidean"), method = "ward.D2")
+hc_mono <- hclust(dist(mat_mono_scaled, method = "euclidean"), method = "ward.D2")
+```
+
+A partir de los coeficientes estimados por los modelos mixtos, se realiza un clustering jerárquico para agrupar TFs con patrones temporales similares. La distancia se calcula sobre los coeficientes escalados y se utiliza el método de Ward para formar clusters compactos.
+
+
+```{r}
+# dendogramas 
+plot(hc_auto, main = "Clustering TFs - autologous", xlab = "", sub = "", labels = FALSE)
+plot(hc_mono, main = "Clustering TFs - monoculture", xlab = "", sub = "", labels = FALSE)
+```
+No podemos apreciar exactamente el clustering con las etiquetas porque hay muchos TFs, pero podemos apreciar cuantos grupos hay.
+
+
+### Heatmaps
+
+
+```{r}
+pheatmap(
+  mat_mono_scaled,
+  cluster_rows = hc_mono,
+  cluster_cols = FALSE,
+  show_rownames = FALSE,
+  main = "Patrones temporales estimados - monoculture",
+  breaks = seq(-3, 3, length.out = 100)
+)
+```
+```{r}
+pheatmap(
+  mat_auto_scaled,
+  cluster_rows = hc_auto,
+  cluster_cols = FALSE,
+  show_rownames = FALSE,
+  main = "Patrones temporales estimados - autologous",
+  breaks = seq(-3, 3, length.out = 100)
+)
+```
+TFs de interés
+```{r}
+tfs_interes <- c(
+  "TP53", "E2F1", "SP1", "STAT1", "NFKB", "CEBPA",
+  "ETS1", "NR3C1", "HIF1A", "RUNX1", "CREB1",
+  "MYC", "FOXO1", "FOXO3", "JUN", "FOS", "IRF1",
+  "IRF4", "RELA", "NFKB1", "NFKB2", "BHLHE40",
+  "PRDM1", "KLF6", "POU2F1", "ELF4"
+)
+
+tfs_interes_auto <- intersect(tfs_interes, rownames(mat_auto_scaled))
+tfs_interes_mono <- intersect(tfs_interes, rownames(mat_mono_scaled))
+
+tfs_interes_auto
+tfs_interes_mono
+```
+```{r}
+mat_auto_interes <- mat_auto_scaled[tfs_interes_auto, , drop = FALSE]
+mat_mono_interes <- mat_mono_scaled[tfs_interes_mono, , drop = FALSE]
+```
+
+```{r}
+pheatmap(
+  mat_mono_interes,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  main = "TFs de interés - monoculture",
+  breaks = seq(-3, 3, length.out = 100)
+)
+```
+
+
+```{r}
+pheatmap(
+  mat_auto_interes,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  main = "TFs de interés - autologous",
+  breaks = seq(-3, 3, length.out = 100)
+)
+```
+
+# ELECCIÓN DEL NÚMERO DE CLUSTERS
+
+Para escoger el número de clusters vamos a usar el método del codo:
+
+```{r}
+# Evaluación exploratoria del número de clusters
+codo_mono <- fviz_nbclust(
+  mat_mono_scaled,
+  FUNcluster = hcut,
+  method = "wss",
+  k.max = 10
+) + 
+  labs(
+  title = "Método del codo - monoculture",
+  x = "Número de clústeres k",
+  y = "Suma de cuadrados intra-clúster"
+)
+
+codo_auto <- fviz_nbclust(
+  mat_auto_scaled,
+  FUNcluster = hcut,
+  method = "wss",
+  k.max = 10
+) + 
+  labs(
+  title = "Método del codo - autologous",
+  x = "Número de clústeres k",
+  y = "Suma de cuadrados intra-clúster"
+)
+
+codo_mono
+codo_auto
+
+ggsave(filename = "C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES/codo_monoculture.png", plot = codo_mono, width = 7, height = 5, dpi = 300)
+ggsave(filename = "C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES/codo_autologous.png", plot = codo_auto, width = 7, height = 5, dpi = 300)
+```
+```{r}
+# SILHOUETTE PARA EVALUAR EL NÚMERO DE CLUSTERS
+
+library(cluster)
+library(dplyr)
+library(ggplot2)
+
+evaluar_silhouette <- function(mat_scaled, hc, condicion, k_values = 2:10) {
+  
+  dist_mat <- dist(mat_scaled, method = "euclidean")
+  
+  resultados <- lapply(k_values, function(k) {
+    
+    clusters <- cutree(hc, k = k) # cortamos dendograma en k grupos
+    sil <- silhouette(clusters, dist_mat) # calculamos silhouette usando la matriz de distancias
+    
+    tibble(
+      condition = condicion,
+      k = k,
+      silhouette_media = mean(sil[, "sil_width"]), # calidad global del clustering para ese número de clústers
+      min_silhouette = min(sil[, "sil_width"]),
+      n_silhouette_negativo = sum(sil[, "sil_width"] < 0),
+      min_tamano_cluster = min(table(clusters)),
+      max_tamano_cluster = max(table(clusters))
+    )
+  }) %>%
+    bind_rows()
+  
+  return(resultados)
+}
+
+sil_mono <- evaluar_silhouette(
+  mat_scaled = mat_mono_scaled,
+  hc = hc_mono,
+  condicion = "monoculture",
+  k_values = 2:10
+)
+
+sil_auto <- evaluar_silhouette(
+  mat_scaled = mat_auto_scaled,
+  hc = hc_auto,
+  condicion = "autologous",
+  k_values = 2:10
+)
+
+silhouette_results <- bind_rows(sil_mono, sil_auto)
+
+silhouette_results
+```
+
+```{r}
+silhouette_results %>%
+  group_by(condition) %>%
+  arrange(desc(silhouette_media), .by_group = TRUE)
+```
+```{r}
+silhouette_results %>%
+  filter(k == 5)
+```
+
+```{r}
+grafico_silhouette <- ggplot(
+  silhouette_results,
+  aes(x = k, y = silhouette_media, color = condition, group = condition)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  labs(
+    title = "Coeficiente Silhouette medio según el número de clústeres",
+    x = "Número de clústeres k",
+    y = "Silhouette medio",
+    color = "Condición"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12)
+  )
+
+grafico_silhouette
+
+ggsave(
+  filename = "C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES/silhouette_lmm.png",
+  plot = grafico_silhouette,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+```{r}
+k <- 4
+
+clusters_mono <- cutree(hc_mono, k = k)
+clusters_auto <- cutree(hc_auto, k = k)
+
+table(clusters_mono)
+table(clusters_auto)
+```
+
+
+```{r}
+k <- 4
+
+clusters_mono <- cutree(hc_mono, k = k)
+clusters_auto <- cutree(hc_auto, k = k)
+
+clusters_mono_df <- data.frame(
+  TF = names(clusters_mono),
+  cluster_mono = clusters_mono
+)
+
+clusters_auto_df <- data.frame(
+  TF = names(clusters_auto),
+  cluster_auto = clusters_auto
+)
+
+clusters_lmm <- clusters_mono_df %>%
+  full_join(clusters_auto_df, by = "TF")
+
+clusters_mono_df %>% count(cluster_mono)
+clusters_auto_df %>% count(cluster_auto)
+```
+
+
+```{r}
+plot(hc_mono, labels = FALSE, main = "Clustering TFs - monoculture",  xlab = "", sub = "" )
+rect.hclust(hc_mono, k = 4, border = "red")
+```
+
+```{r}
+# Ver TFs en clústeres pequeños para k = 4
+
+clusters_mono_df %>%
+  count(cluster_mono)
+
+clusters_auto_df %>%
+  count(cluster_auto)
+
+# TF del clúster unitario en monoculture
+clusters_mono_df %>%
+  filter(cluster_mono == 4)
+
+# TFs del clúster pequeño en autologous
+clusters_auto_df %>%
+  filter(cluster_auto == 4)
+```
+
+```{r}
+# Coeficientes de los TFs en clústeres pequeños
+
+tf_mono_peq <- clusters_mono_df %>%
+  filter(cluster_mono == 4) %>%
+  pull(TF)
+
+tf_auto_peq <- clusters_auto_df %>%
+  filter(cluster_auto == 4) %>%
+  pull(TF)
+
+coef_by_condition %>%
+  filter(TF %in% tf_mono_peq | TF %in% tf_auto_peq)
+```
+
+Vemos donde caen cada TF:
+```{r}
+k <- 4
+
+clusters_mono <- cutree(hc_mono, k = k)
+clusters_auto <- cutree(hc_auto, k = k)
+
+clusters_mono_df <- tibble(
+  TF = names(clusters_mono),
+  condition = "monoculture",
+  cluster = as.integer(clusters_mono)
+)
+
+clusters_auto_df <- tibble(
+  TF = names(clusters_auto),
+  condition = "autologous",
+  cluster = as.integer(clusters_auto)
+)
+
+clusters_lmm_long <- bind_rows(
+  clusters_mono_df,
+  clusters_auto_df
+)
+
+clusters_lmm_long
+```
+
+```{r}
+tfs_por_cluster <- clusters_lmm_long %>%
+  group_by(condition, cluster) %>%
+  summarise(
+    n_TFs = n(),
+    TFs = paste(sort(TF), collapse = ", "),
+    .groups = "drop"
+  )
+
+tfs_por_cluster
+```
+```{r}
+tfs_interes <- c(
+  "TP53", "E2F1", "SP1", "STAT1", "NFKB", "CEBPA",
+  "ETS1", "NR3C1", "HIF1A", "RUNX1", "CREB1",
+  "MYC", "FOXO1", "FOXO3", "JUN", "FOS", "IRF1",
+  "IRF4", "RELA", "NFKB1", "NFKB2", "BHLHE40",
+  "PRDM1", "KLF6", "POU2F1", "ELF4"
+)
+
+clusters_tfs_interes <- clusters_lmm_long %>%
+  filter(TF %in% tfs_interes) %>%
+  arrange(TF, condition)
+
+clusters_tfs_interes
+```
+
+```{r}
+clusters_tfs_interes_wide <- clusters_tfs_interes %>%
+  select(TF, condition, cluster) %>%
+  pivot_wider(
+    names_from = condition,
+    values_from = cluster,
+    names_prefix = "cluster_"
+  ) %>%
+  arrange(TF)
+
+clusters_tfs_interes_wide
+```
+
+```{r}
+tfs_interes_por_cluster <- clusters_lmm_long %>%
+  filter(TF %in% tfs_interes) %>%
+  group_by(condition, cluster) %>%
+  summarise(
+    n_TFs_interes = n(),
+    TFs_interes = paste(sort(TF), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(condition, cluster)
+
+tfs_interes_por_cluster
+```
+```{r}
+tfs_interes_no_encontrados <- setdiff(
+  tfs_interes,
+  unique(clusters_lmm_long$TF)
+)
+
+tfs_interes_no_encontrados
+```
+```{r}
+clusters <- cutree(hc_mono, k = 4)
+
+data$Cluster <- as.factor(clusters)
+
+fviz_cluster(list(data = scaled_value, cluster = clusters),
+             geom = "point",
+             ellipse.type = "convex",
+             main = "Hierarchical Clustering (k = 3)")
+```
+
+
+# CALCULAMOS PERFILES
+
+```{r}
+# Asegúrate de que los clusters están con k = 4
+k <- 4
+
+clusters_mono <- cutree(hc_mono, k = k)
+clusters_auto <- cutree(hc_auto, k = k)
+
+clusters_mono_df <- data.frame(
+  TF = names(clusters_mono),
+  cluster = as.integer(clusters_mono),
+  condition = "monoculture"
+)
+
+clusters_auto_df <- data.frame(
+  TF = names(clusters_auto),
+  cluster = as.integer(clusters_auto),
+  condition = "autologous"
+)
+
+clusters_condition <- bind_rows(clusters_mono_df, clusters_auto_df)
+```
+
+```{r}
+df_cluster_profiles <- df_model %>%
+  mutate(
+    TF = as.character(TF),
+    condition = as.character(condition)
+  ) %>%
+  inner_join(clusters_condition, by = c("TF", "condition")) %>%
+  group_by(condition, cluster, time, time_num) %>%
+  summarise(
+    mean_activity = mean(value_scaled, na.rm = TRUE),
+    sd_activity = sd(value_scaled, na.rm = TRUE),
+    se_activity = sd_activity / sqrt(n()),
+    n_obs = n(),
+    n_TFs = n_distinct(TF),
+    .groups = "drop"
+  )
+
+df_cluster_profiles
+```
+```{r}
+grafico_perfiles_cluster <- ggplot(
+  df_cluster_profiles,
+  aes(
+    x = time_num,
+    y = mean_activity,
+    group = factor(cluster),
+    color = factor(cluster)
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ condition) +
+  labs(
+    title = "Perfil medio de actividad reguladora por clúster",
+    x = "Tiempo",
+    y = "Actividad reguladora escalada media",
+    color = "Clúster"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12)
+  )
+
+grafico_perfiles_cluster
+```
+
+```{r}
+grafico_perfiles_facet <- ggplot(
+  df_cluster_profiles,
+  aes(
+    x = time_num,
+    y = mean_activity,
+    group = 1
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  facet_grid(condition ~ cluster) +
+  labs(
+    title = "Perfiles dinámicos medios por condición y clúster",
+    x = "Tiempo",
+    y = "Actividad reguladora escalada media"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12),
+    strip.text = element_text(size = 13, face = "bold")
+  )
+
+grafico_perfiles_facet
+```
+```{r}
+resumen_perfiles_cluster <- df_cluster_profiles %>%
+  group_by(condition, cluster) %>%
+  summarise(
+    n_TFs = first(n_TFs),
+    actividad_D1 = mean_activity[which.min(time_num)],
+    actividad_D14 = mean_activity[which.max(time_num)],
+    cambio_D14_D1 = actividad_D14 - actividad_D1,
+    actividad_max = max(mean_activity, na.rm = TRUE),
+    tiempo_max = time[which.max(mean_activity)],
+    actividad_min = min(mean_activity, na.rm = TRUE),
+    tiempo_min = time[which.min(mean_activity)],
+    rango = actividad_max - actividad_min,
+    .groups = "drop"
+  ) %>%
+  arrange(condition, cluster)
+
+resumen_perfiles_cluster
+```
+
+
+
+# RELACIONES CANDIDATAS USANDO COLLECTRI
+
+Buscamos relaciones en CollecTRI de los TFs que se encuentran en el mismo cluster, para ver cuántas podríamos encontrar significativas y poder compararlo con MORE y dynGENIE3.
+
+```{r}
+collectri_net <- decoupleR::get_collectri(
+  organism = "human",
+  split_complexes = FALSE
+)
+```
+
+Filtramos CollecTRI donde tanto el regulador como el target están en los TFs.
+```{r}
+TFs_lmm <- as.character(unique(df_model$TF))
+
+# 1. Preparamos relaciones TF-TF de CollecTRI
+collectri_edges <- collectri_net %>%
+  dplyr::select(source, target, mor) %>%
+  dplyr::mutate(
+    regulator = stringr::str_remove(source, "^TF-"),
+    target = stringr::str_remove(target, "^TF-")
+  ) %>%
+  dplyr::select(regulator, target, mor) %>%
+  dplyr::filter(
+    regulator %in% TFs_lmm,
+    target %in% TFs_lmm,
+    regulator != target
+  ) %>%
+  dplyr::mutate(
+    edge = paste(regulator, target, sep = "->")
+  ) %>%
+  dplyr::distinct(regulator, target, .keep_all = TRUE)
+
+dim(collectri_edges)
+head(collectri_edges)
+```
+
+```{r}
+# 2. Creamos asignaciones de clúster por condición
+
+k <- 4
+
+cluster_assignments <- dplyr::bind_rows(
+  tibble(
+    TF = names(cutree(hc_mono, k = k)),
+    condition = "monoculture",
+    cluster = as.integer(cutree(hc_mono, k = k))
+  ),
+  tibble(
+    TF = names(cutree(hc_auto, k = k)),
+    condition = "autologous",
+    cluster = as.integer(cutree(hc_auto, k = k))
+  )
+)
+
+cluster_assignments %>%
+  count(condition, cluster)
+```
+
+
+```{r}
+# 3. Función para conservar relaciones donde regulador y target estén en el mismo clúster
+
+obtener_edges_lmm_collectri <- function(condicion) {
+  
+  clusters_cond <- cluster_assignments %>%
+    filter(condition == condicion)
+  
+  clusters_reg <- clusters_cond %>%
+    transmute(
+      regulator = TF,
+      cluster_regulator = cluster
+    )
+  
+  clusters_target <- clusters_cond %>%
+    transmute(
+      target = TF,
+      cluster_target = cluster
+    )
+  
+  collectri_edges %>%
+    inner_join(clusters_reg, by = "regulator") %>%
+    inner_join(clusters_target, by = "target") %>%
+    filter(cluster_regulator == cluster_target) %>%
+    mutate(
+      condition = condicion,
+      method = "LMM_CollecTRI"
+    )
+}
+
+lmm_edges_mono <- obtener_edges_lmm_collectri("monoculture")
+lmm_edges_auto <- obtener_edges_lmm_collectri("autologous")
+
+dim(lmm_edges_mono)
+dim(lmm_edges_auto)
+
+head(lmm_edges_mono)
+head(lmm_edges_auto)
+```
+
+```{r}
+nrow(collectri_edges)
+nrow(lmm_edges_mono)
+nrow(lmm_edges_auto)
+
+lmm_edges_mono %>%
+  count(cluster_regulator, name = "n_edges_mono")
+
+lmm_edges_auto %>%
+  count(cluster_regulator, name = "n_edges_auto")
+```
+```{r}
+edges_mono_id <- lmm_edges_mono$edge
+edges_auto_id <- lmm_edges_auto$edge
+
+edges_common <- intersect(edges_mono_id, edges_auto_id)
+edges_mono_specific <- setdiff(edges_mono_id, edges_auto_id)
+edges_auto_specific <- setdiff(edges_auto_id, edges_mono_id)
+
+lmm_edges_summary <- tibble(
+  category = c(
+    "Comunes",
+    "Específicas monoculture",
+    "Específicas autologous"
+  ),
+  n_edges = c(
+    length(edges_common),
+    length(edges_mono_specific),
+    length(edges_auto_specific)
+  )
+)
+
+lmm_edges_summary
+```
+```{r}
+edges_LMM <- bind_rows(lmm_edges_mono, lmm_edges_auto) %>%
+  transmute(
+    regulator,
+    target,
+    condition,
+    method,
+    cluster_regulator,
+    cluster_target,
+    mor,
+    edge
+  ) %>%
+  distinct()
+
+head(edges_LMM)
+dim(edges_LMM)
+
+edges_LMM %>%
+  count(condition, name = "n_edges")
+```
+
+
+Y ahora creamos las asociaciones candidatas:
+
+```{r}
+lmm_edges_mono <- collectri_edges %>%
+  inner_join(clusters_mono_df, by = c("regulator" = "TF")) %>%
+  rename(cluster_regulator = cluster_mono) %>%
+  inner_join(clusters_mono_df, by = c("target" = "TF")) %>%
+  rename(cluster_target = cluster_mono) %>%
+  filter(cluster_regulator == cluster_target)
+
+dim(lmm_edges_mono)
+head(lmm_edges_mono)
+```
+
+```{r}
+lmm_edges_auto <- collectri_edges %>%
+  inner_join(clusters_auto_df, by = c("regulator" = "TF")) %>%
+  rename(cluster_regulator = cluster_auto) %>%
+  inner_join(clusters_auto_df, by = c("target" = "TF")) %>%
+  rename(cluster_target = cluster_auto) %>%
+  filter(cluster_regulator == cluster_target)
+
+dim(lmm_edges_auto)
+head(lmm_edges_auto)
+```
+
+Me quedo con relaciones de CollecTRI donde regulador y target pertenecen al mismo cluster temporal.
+Me quedo con relaciones de CollecTRI donde regulador y target pertenecen al mismo cluster temporal.
+
+```{r}
+nrow(collectri_edges)
+nrow(lmm_edges_mono)
+nrow(lmm_edges_auto)
+```
+```{r}
+lmm_edges_mono %>% dplyr::count(cluster_regulator, name = "n_edges_mono")
+lmm_edges_auto %>% dplyr::count(cluster_regulator, name = "n_edges_auto")
+```
+
+Comparación entre condiciones.
+
+```{r}
+lmm_edges_mono <- lmm_edges_mono %>%
+  mutate(
+    regulator = stringr::str_remove(regulator, "^TF-"),
+    target = stringr::str_remove(target, "^TF-"),
+    edge = paste(regulator, target, sep = "->")
+  )
+
+lmm_edges_auto <- lmm_edges_auto %>%
+  mutate(
+    regulator = stringr::str_remove(regulator, "^TF-"),
+    target = stringr::str_remove(target, "^TF-"),
+    edge = paste(regulator, target, sep = "->")
+  )
+
+edges_mono_id <- lmm_edges_mono$edge
+edges_auto_id <- lmm_edges_auto$edge
+
+edges_common <- intersect(edges_mono_id, edges_auto_id)
+edges_mono_specific <- setdiff(edges_mono_id, edges_auto_id)
+edges_auto_specific <- setdiff(edges_auto_id, edges_mono_id)
+
+length(edges_common)
+length(edges_mono_specific)
+length(edges_auto_specific)
+```
+```{r}
+lmm_edges_summary <- data.frame(
+  category = c(
+    "Comunes",
+    "Específicas monoculture",
+    "Específicas autologous"
+  ),
+  n_edges = c(
+    length(edges_common),
+    length(edges_mono_specific),
+    length(edges_auto_specific)
+  )
+)
+
+lmm_edges_summary
+```
+
+
+Filtro adicional: solo aristas donde regulador y target tienen algún coeficiente temporal significativo en esa condición.
+
+
+```{r}
+tf_significance <- coef_by_condition %>%
+  mutate(
+    sig_mono = rowSums(dplyr::select(., mono_b1, mono_b2, mono_b3, mono_b4) != 0) > 0,
+    sig_auto = rowSums(dplyr::select(., auto_b1, auto_b2, auto_b3, auto_b4) != 0) > 0
+  ) %>%
+  dplyr::select(TF, sig_mono, sig_auto)
+```
+
+
+```{r}
+lmm_edges_mono_sig <- lmm_edges_mono %>%
+  left_join(tf_significance %>% dplyr::select(TF, sig_mono), by = c("regulator" = "TF")) %>%
+  rename(sig_regulator = sig_mono) %>%
+  left_join(tf_significance %>% dplyr::select(TF, sig_mono), by = c("target" = "TF")) %>%
+  rename(sig_target = sig_mono) %>%
+  filter(sig_regulator == TRUE, sig_target == TRUE)
+
+head(lmm_edges_mono_sig)
+dim(lmm_edges_mono_sig)
+```
+
+Nos quedamos con las aristas donde tanto regulador como target tienen algún coeficiente significativo.
+
+
+```{r}
+lmm_edges_auto_sig <- lmm_edges_auto %>%
+  left_join(tf_significance %>% dplyr::select(TF, sig_auto), by = c("regulator" = "TF")) %>%
+  rename(sig_regulator = sig_auto) %>%
+  left_join(tf_significance %>% dplyr::select(TF, sig_auto), by = c("target" = "TF")) %>%
+  rename(sig_target = sig_auto) %>%
+  filter(sig_regulator == TRUE, sig_target == TRUE)
+
+dim(lmm_edges_auto_sig)
+head(lmm_edges_auto_sig)
+```
+
+Tabla final de aristas LMM-CollecTRI.
+
+```{r}
+edges_LMM_auto <- lmm_edges_auto %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = target,
+    condition = "autologous",
+    method = "LMM_CollecTRI",
+    cluster_regulator = cluster_regulator,
+    cluster_target = cluster_target,
+    edge = edge
+  ) %>%
+  dplyr::distinct()
+
+edges_LMM_mono <- lmm_edges_mono %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = target,
+    condition = "monoculture",
+    method = "LMM_CollecTRI",
+    cluster_regulator = cluster_regulator,
+    cluster_target = cluster_target,
+    edge = edge
+  ) %>%
+  dplyr::distinct()
+
+edges_LMM <- dplyr::bind_rows(edges_LMM_auto, edges_LMM_mono)
+
+head(edges_LMM)
+dim(edges_LMM)
+
+edges_LMM %>% dplyr::count(condition, name = "n_edges")
+```
+

@@ -1,0 +1,526 @@
+---
+title: "Exploratoy Data Analysis of CLL Time-Series RNA-seq Data"
+author: "Andrea"
+date: "2026-02"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Cargamos las librerías necesarias
+
+```{r}
+# Cargamos las librerías necesarias para:
+# - manipulación de datos
+# - análisis PCA
+# - visualización de resultados
+
+library(dplyr)
+library(stringr)
+library(readr)
+library(PLSandO)
+library(ggplot2)
+library(pheatmap)
+library(gridExtra)
+library(cowplot)
+```
+
+```{r}
+# Definimos las carpetas donde se guardarán las figuras y tablas generadas.
+# Estas rutas permiten organizar los resultados del análisis.
+dir_figures <- "results/figures"
+dir_tables <- "results/tables"
+
+dir.create(dir_figures, recursive = TRUE, showWarnings = FALSE)
+dir.create(dir_tables, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+## 1. Carga de datos y análisis de los datasets
+
+```{r}
+# Cargamos las matrices de expresión correspondientes a la condición autologous.
+# Cada archivo contiene una versión diferente de los datos: conteos crudos,
+# datos normalizados, datos transformados en log2 y subconjunto de TFs.
+
+auto_log2 <- read.table("/Users/andya/Escritorio/TFG/autologous_log2normalized_counts.txt", header = TRUE, row.names = 1, sep = "\t")
+auto_norm_counts <- read.table("/Users/andya/Escritorio/TFG/normalized_counts.txt",  header = TRUE, row.names = 1, sep = "\t")
+auto_norm_counts_TF <- read.table("/Users/andya/Escritorio/TFG/normalized_counts_TF.txt",header = TRUE, row.names = 1, sep = "\t")
+auto_raw_counts <- read.table("/Users/andya/Escritorio/TFG/unnormalized_counts.txt",header = TRUE, row.names = 1, sep = "\t")
+
+# Cargamos las matrices de expresión correspondientes a la condición monoculture.
+# Se mantiene la misma estructura que en la condición autologous para poder comparar ambas.
+mono_log2 <- read.table("/Users/andya/Escritorio/TFG/monoculture_log2normalized_counts.txt", header = TRUE, row.names = 1, sep = "\t")
+mono_norm_counts <- read.table("/Users/andya/Escritorio/TFG/normalized_counts.txt",  header = TRUE, row.names = 1, sep = "\t")
+mono_norm_counts_TF <- read.table("/Users/andya/Escritorio/TFG/normalized_counts_TF.txt",header = TRUE, row.names = 1, sep = "\t")
+mono_raw_counts <- read.table("/Users/andya/Escritorio/TFG/unnormalized_counts.txt",header = TRUE, row.names = 1, sep = "\t")
+
+```
+
+```{r}
+# Resumen opcional de los datasets de entrada
+# Creamos una tabla resumen con las dimensiones de cada dataset cargado.
+# Esto permite comprobar rápidamente el número de genes/TFs y muestras disponibles.
+
+dataset_summary <- tibble(
+  dataset = c(
+    "auto_raw_counts", "auto_log2", "auto_norm_counts",
+    "auto_norm_counts_TF",
+    "mono_raw_counts", "mono_log2", "mono_norm_counts",
+    "mono_norm_counts_TF"
+  ),
+  n_rows = c(
+    nrow(auto_raw_counts), nrow(auto_log2), nrow(auto_norm_counts),
+    nrow(auto_norm_counts_TF),
+    nrow(mono_raw_counts), nrow(mono_log2), nrow(mono_norm_counts),
+    nrow(mono_norm_counts_TF)
+  ),
+  n_cols = c(
+    ncol(auto_raw_counts), ncol(auto_log2), ncol(auto_norm_counts),
+    ncol(auto_norm_counts_TF),
+    ncol(mono_raw_counts), ncol(mono_log2), ncol(mono_norm_counts),
+    ncol(mono_norm_counts_TF)
+  )
+)
+
+dataset_summary
+```
+
+
+
+# PCA
+
+Unimos ambos datasets, tanto el de autologous como el de monoculture para poder hacer el PCA.
+```{r}
+# Seleccionamos únicamente los genes presentes en ambas condiciones.
+# Esto garantiza que las matrices de autologous y monoculture sean comparables.
+common_genes <- intersect(rownames(auto_log2), rownames(mono_log2))
+common_genes <- intersect(rownames(auto_log2), rownames(mono_log2))
+
+# Filtramos ambas matrices para quedarnos solo con los genes comunes.
+auto_common <- auto_log2[common_genes, , drop = FALSE]
+mono_common <- mono_log2[common_genes, , drop = FALSE]
+
+# Unimos las dos condiciones en una única matriz de expresión.
+# La matriz resultante tiene genes en filas y muestras en columnas.
+X <- cbind(auto_common, mono_common)
+
+
+```
+
+Preparamos la tabla para el PCA creando un metadata con las colunmas de condición, tiempo, paciente y réplica, donde leemos el nombre de las columnas y lo dividimos para obtener los valores de las columnas.
+
+```{r}
+# Construimos una tabla de metadatos a partir del nombre de las muestras.
+# Se extraen la condición experimental, el tiempo, el paciente y la réplica.
+
+sample_names <- colnames(X)
+
+meta <- data.frame(sample = sample_names) %>%
+  mutate(
+    condition = ifelse(sample %>% str_detect("auto"), "autologous", "monoculture"),
+    time      = str_extract(sample, "D\\d+"),          # D1, D4, D8, D11, D14
+    patient   = str_extract(sample, "p\\d+"),          # p1, p2, p3 
+    replicate = str_extract(sample, "rep\\d+")         # rep1, rep2
+  )
+
+# Ordenamos los tiempos de forma cronológica para que aparezcan correctamente en los gráficos.
+meta$time <- factor(meta$time,
+                    levels = c("D1", "D4", "D8", "D11", "D14"))
+
+meta
+```
+
+
+```{r}
+# Comprobamos que el orden de las muestras en la matriz de expresión
+# coincide con el orden de la tabla de metadatos.
+stopifnot(identical(meta$sample, colnames(X)))
+
+# Calculamos el número de valores perdidos en cada columna de metadatos.
+# Si hubiera valores NA, podrían afectar al PCA o a la representación gráfica.o
+metadata_na_summary <- meta %>%
+  summarise(across(everything(), ~ sum(is.na(.))))
+
+metadata_na_summary
+```
+
+
+Realizamos un boxplot para comprobar que los datos están bien normalizados.
+```{r}
+# Representamos la distribución de expresión de cada muestra.
+# Este gráfico permite comprobar visualmente si las muestras presentan
+# distribuciones comparables después de la normalización.
+boxplot(X,
+        las = 2,
+        cex.axis = 0.6,
+        main = "Distribución de expresión por muestra",
+        ylab = "log2 expresión")
+```
+
+
+```{r}
+# Calculamos la correlación de Pearson entre muestras.
+# Este análisis permite evaluar si las muestras se agrupan por paciente,
+# condición experimental, tiempo o réplica.
+cor_mat <- cor(X, method = "pearson")
+
+library(pheatmap)
+
+annotation <- meta[, c("condition","time","patient","replicate")]
+rownames(annotation) <- meta$sample
+
+pheatmap(cor_mat,
+         annotation_col = annotation,
+         annotation_row = annotation,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         main = "Correlación entre muestras")
+```
+
+
+# PCA GLOBAL
+
+
+```{r}
+# Transponemos la matriz para que las muestras queden en filas
+# y los genes en columnas, que es el formato requerido para el PCA.
+X_t <- t(X)
+
+# Realizamos el PCA sobre la matriz de expresión log2-normalizada.
+mypca <- pca(as.data.frame(X_t), scaling = "None")
+
+```
+
+
+```{r}
+p# Scree plot
+p_scree <- pcaPlot(
+  mypca,
+  type = "scree"
+)
+
+# Guardamos el scree plot para visualizar la varianza explicada por cada componente.
+ggsave(
+  filename = file.path(dir_figures, "PCA_scree_plot.png"),
+  plot = p_scree,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+# PCA coloreado por condición
+p_pca_condition <- pcaPlot(
+  mypca,
+  type = "scores",
+  comp = c(1, 2),
+  colBy = data.frame(condition = meta$condition),
+  labels = FALSE
+)
+
+# Guardamos el PCA coloreado por condición experimental.
+# Este gráfico permite comprobar si autologous y monoculture se separan globalmente.
+ggsave(
+  filename = file.path(dir_figures, "PCA_PC1_PC2_condition.png"),
+  plot = p_pca_condition,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+# PCA coloreado por tiempo
+p_pca_time <- pcaPlot(
+  mypca,
+  type = "scores",
+  comp = c(1, 2),
+  colBy = data.frame(time = meta$time),
+  labels = FALSE
+)
+
+# Guardamos el PCA coloreado por tiempo.
+# Este gráfico permite explorar si existe una estructura temporal en los datos.
+ggsave(
+  filename = file.path(dir_figures, "PCA_PC1_PC2_time.png"),
+  plot = p_pca_time,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+# PCA coloreado por paciente
+p_pca_patient <- pcaPlot(
+  mypca,
+  type = "scores",
+  comp = c(1, 2),
+  colBy = data.frame(patient = meta$patient),
+  labels = FALSE
+)
+
+# Guardamos el PCA coloreado por paciente.
+# Este gráfico permite evaluar si el paciente es una fuente importante de variación.
+ggsave(
+  filename = file.path(dir_figures, "PCA_PC1_PC2_patient.png"),
+  plot = p_pca_patient,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+p_scree
+p_pca_condition
+p_pca_time
+p_pca_patient
+
+```
+
+
+```{r}
+# PCA por tiempo
+p_pca_time_pc3_pc4 <- pcaPlot(
+  mypca,
+  type = "scores",
+  comp = c(3, 4),
+  colBy = data.frame(time = meta$time),
+  labels = FALSE
+)
+
+ggsave(
+  filename = file.path(dir_figures, "PCA_time_PC3_PC4.png"),
+  plot = p_pca_time_pc3_pc4,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+p_pca_time_pc4_pc5 <- pcaPlot(
+  mypca,
+  type = "scores",
+  comp = c(4, 5),
+  colBy = data.frame(time = meta$time),
+  labels = FALSE
+)
+
+ggsave(
+  filename = file.path(dir_figures, "PCA_time_PC4_PC5.png"),
+  plot = p_pca_time_pc4_pc5,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+p_pca_time_pc4_pc6 <- pcaPlot(
+  mypca,
+  type = "scores",
+  comp = c(6, 4),
+  colBy = data.frame(time = meta$time),
+  labels = FALSE
+)
+
+ggsave(
+  filename = file.path(dir_figures, "PCA_time_PC4_PC6.png"),
+  plot = p_pca_time_pc4_pc6,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+p_pca_time_pc3_pc4
+p_pca_time_pc4_pc5
+p_pca_time_pc4_pc6
+
+```
+
+
+
+```{r}
+# Función para realizar un PCA independiente para cada paciente.
+# Esto permite estudiar la evolución temporal de cada paciente evitando
+# que la variabilidad interindividual domine la representación.
+patient_pca_plsando <- function(expr_matrix, meta) {
+  
+  library(dplyr)
+  library(ggplot2)
+  library(gridExtra)
+  library(cowplot)
+  
+  # Inicializamos listas para guardar los gráficos, los scores del PCA
+  # y la varianza explicada de cada paciente.
+  plots <- list()
+  scores_list <- list()
+  var_exp_list <- list()
+  
+  patient_labels <- c(
+    p1 = "PCA plot: Patient 1",
+    p2 = "PCA plot: Patient 2",
+    p3 = "PCA plot: Patient 3"
+  )
+  
+  # Primer bucle: calculamos el PCA de cada paciente y guardamos sus resultados.
+  for (pat in unique(meta$patient)) {
+    
+    meta_pat <- meta %>% 
+      filter(patient == pat)
+    
+    # Seleccionamos únicamente las muestras del paciente actual.
+    samples_pat <- meta_pat$sample
+    expr_pat <- expr_matrix[, samples_pat, drop = FALSE]
+    
+    # Transponemos la matriz para tener muestras en filas y genes en columnas.
+    expr_pat_t <- t(expr_pat)
+    
+    # Calculamos el PCA del paciente actual.
+    pca_pat <- pca(as.data.frame(expr_pat_t), scaling = "None")
+    
+    # Extraemos los scores del PCA y los combinamos con los metadatos.
+    scores_pat <- as.data.frame(pca_pat$scores)
+    scores_pat$sample <- rownames(scores_pat)
+    scores_pat <- left_join(scores_pat, meta_pat, by = "sample")
+    
+    # Calculamos el porcentaje de varianza explicada por cada componente.
+    score_vars <- apply(pca_pat$scores, 2, var)
+    var_exp <- round(100 * score_vars / sum(score_vars), 1)
+    
+    scores_list[[pat]] <- scores_pat
+    var_exp_list[[pat]] <- var_exp
+  }
+  
+  # Calculamos límites comunes para los ejes de todos los pacientes.
+  # Esto facilita la comparación visual entre paneles.
+  all_scores <- dplyr::bind_rows(scores_list)
+  
+  x_lim <- range(all_scores$p1, na.rm = TRUE)
+  y_lim <- range(all_scores$p2, na.rm = TRUE)
+  
+  x_margin <- diff(x_lim) * 0.08
+  y_margin <- diff(y_lim) * 0.08
+  
+  x_lim <- c(x_lim[1] - x_margin, x_lim[2] + x_margin)
+  y_lim <- c(y_lim[1] - y_margin, y_lim[2] + y_margin)
+  
+  # Segundo bucle: generamos el gráfico PCA de cada paciente.
+  for (pat in unique(meta$patient)) {
+    
+    scores_pat <- scores_list[[pat]]
+    var_exp <- var_exp_list[[pat]]
+    
+    p <- ggplot(
+      scores_pat,
+      aes(
+        x = p1,
+        y = p2,
+        color = condition,
+        shape = time,
+        label = time
+      )
+    ) +
+      geom_point(size = 3.6) +
+      geom_text(
+        vjust = -0.7,
+        size = 3.6,
+        show.legend = FALSE
+      ) +
+      scale_color_manual(
+        values = c(
+          autologous = "#1b9e77",
+          monoculture = "#e69f00"
+        )
+      ) +
+      scale_shape_manual(
+        values = c(
+          D1 = 16,
+          D4 = 17,
+          D8 = 15,
+          D11 = 3,
+          D14 = 4
+        )
+      ) +
+      coord_cartesian(
+        xlim = x_lim,
+        ylim = y_lim
+      ) +
+      labs(
+        title = patient_labels[[pat]],
+        x = paste0("PC1, VarExp: ", var_exp[1], "%"),
+        y = paste0("PC2, VarExp: ", var_exp[2], "%"),
+        color = "Condition",
+        shape = "Day"
+      ) +
+      theme_bw(base_size = 14) +
+      theme(
+        plot.title = element_text(size = 16),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none"
+      )
+    
+    plots[[pat]] <- p
+  }
+  
+  # Gráfico auxiliar solo para extraer la leyenda
+  p_legend <- ggplot(
+    all_scores,
+    aes(
+      x = p1,
+      y = p2,
+      color = condition,
+      shape = time
+    )
+  ) +
+    geom_point(size = 3.6) +
+    scale_color_manual(
+      values = c(
+        autologous = "#1b9e77",
+        monoculture = "#e69f00"
+      )
+    ) +
+    scale_shape_manual(
+      values = c(
+        D1 = 16,
+        D4 = 17,
+        D8 = 15,
+        D11 = 3,
+        D14 = 4
+      )
+    ) +
+    labs(
+      color = "Condition",
+      shape = "Day"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+  
+  legend <- cowplot::get_legend(p_legend)
+  
+  # Unir los tres gráficos con el mismo tamaño + leyenda aparte
+  p_final <- gridExtra::arrangeGrob(
+    grobs = c(plots, list(legend)),
+    nrow = 1,
+    widths = c(1, 1, 1, 0.35)
+  )
+  
+  return(p_final)
+}
+```
+
+```{r}
+p_pca_pacientes <- patient_pca_plsando(X, meta)
+
+ggsave(
+  filename = file.path(dir_figures,"PCA_por_pacientes.png"),
+  plot = p_pca_pacientes,
+  width = 14,
+  height = 4.8,
+  dpi = 300
+)
+p_pca_pacientes
+```
+

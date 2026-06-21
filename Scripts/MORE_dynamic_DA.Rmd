@@ -1,0 +1,1388 @@
+---
+title: "MORE_dynamic"
+author: "Andrea"
+date: "2026-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# LIBRERÍAS 
+
+```{r libraries}
+# Librerías principales para aplicar MORE y cargar la red CollecTRI
+library(MORE)
+library(decoupleR)
+
+# Manipulación y visualización de datos
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+
+# Dependencias utilizadas por MORE
+library(ropls)
+library(furrr)
+library(purrr)
+library(igraph)
+library(ltm)
+library(psych)
+library(MASS)
+library(glmnet)
+library(car)
+```
+
+
+
+# PREPARACIÓN DATOS DE ENTRADA
+
+## CARGA DE DATOS
+Datos que usaremos para TagetData
+```{r}
+auto_log2 <- read.table("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Autologous/autologous_log2normalized_counts.txt",
+                        header = TRUE, row.names = 1, sep = "\t")
+mono_log2 <- read.table("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Monoculture/monoculture_log2normalized_counts.txt",
+                        header = TRUE, row.names = 1, sep = "\t")
+
+auto_norm <- read.table("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Autologous/normalized_counts.txt",
+                        header = TRUE, row.names = 1, sep = "\t")
+mono_norm <- read.table("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Monoculture/normalized_counts.txt",
+                        header = TRUE, row.names = 1, sep = "\t")
+```
+
+
+
+Cargamos la red COllecTRI:
+```{r}
+collectri_net <- decoupleR::get_collectri(
+  organism = "human",
+  split_complexes = FALSE
+)
+```
+En CollecTRI tenemos 52281 regulaciones.
+
+Cargamos las actividades de los TFs obtenidos con VIPER para tener el Regulatory Data
+```{r}
+TF_activity_auto <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/auto_TF_score_collectri.csv")
+TF_activity_mono <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/mono_TF_score_collectri.csv")
+```
+TF_activity_auto tiene 714 filas
+TF_activity_mono tiene 693 filas
+
+
+Cargamos los TFs diferencialmente activos obtenidos con msVIPER:
+
+Primero cargamos los datos de msVIPER (los TFs diferencialmente activos)
+```{r}
+TF_msVIPER_auto <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/msViper_auto_TFs.csv")
+TF_msVIPER_mono <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/msViper_mono_TFs.csv")
+
+```
+Los DA TFs que obtenemos con msVIPER para cada condición son 106 y 109 respectivamente.
+
+Cargamos los resultados de dynGENIE3 también
+```{r}
+dynGENIE3_auto <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/GRN_auto_withTFs_msViper_TFs_001.csv")
+dynGENIE3_mono <- read.csv("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/Datos/GRN_mono_withTFs_msViper_TFs_001.csv")
+
+```
+
+Tenemos 2154 y 2163 regulaciones significativas respectivamente.
+
+
+# CREAMOS TARGET DATA Y REGULATORY DATA COMO dynGENIE3
+
+Cargamos las funciones que usan en dynGENIE3:
+```{r}
+# Separar las series temporales por paciente y réplica
+process_TF_activity <- function(TF_activity, TFs_vector, sample_suffixes) {
+  
+  TF_activity <- as.data.frame(TF_activity)
+  
+  TF_activity_TF <- TF_activity[
+    TFs_vector,
+    ,
+    drop = FALSE
+  ]
+  
+  df_conditions <- sapply(
+    sample_suffixes,
+    function(x) TF_activity_TF[endsWith(names(TF_activity_TF), x)],
+    simplify = FALSE
+  )
+  
+  TF_activity_list <- lapply(df_conditions, function(x) as.matrix(x))
+  
+  return(list(
+    TF_activity_TF = TF_activity_TF,
+    TF_activity_list = TF_activity_list,
+    TFs_vector = TFs_vector
+  ))
+}
+
+```
+
+
+## Estimar tasas de degradación
+
+Estas funciones reproducen la lógica usada para estimar `alpha`.
+```{r}
+calculate_decay_rates <- function(normalized_data_list, time_points_list, digits = 2) {
+  # Transpose the data frames
+  transposed_data <- lapply(normalized_data_list, t)
+  
+  # Create a list of time point matrices
+  time_points_matrices <- lapply(time_points_list, as.matrix)
+  
+  # Match the length of the time_points_matrices to the length of transposed_data
+  matched_time_points <- rep(time_points_matrices, length.out = length(transposed_data))
+  
+  
+  alphas <- estimate.decay.rates(transposed_data, matched_time_points)
+  
+  decay_rates_median <- median(alphas, na.rm = TRUE)
+  
+  mode <- function(x) {
+    return(as.numeric(names(which.max(table(x)))))
+  }
+  
+  alphas_rounded <- round(alphas, digits = digits)
+  decay_rates_mode <- mode(alphas_rounded)
+  
+  return(list(median = decay_rates_median, mode = decay_rates_mode))
+}
+
+
+estimate.decay.rates <- function(TS.data, time.points) {
+	# For each gene, the decay rate is estimated by assuming that the gene expression x(t) follows:
+    # x(t) =  A exp(-alpha * t) + C_min,
+    # between the highest and lowest expression values.
+    # C_min is set to the minimum expression value over all genes and all samples.
+	
+	num.exp <- length(TS.data)
+	gene.names <- colnames(TS.data[[1]])
+	num.genes <- length(gene.names)
+	
+	C_min <- min(TS.data[[1]])
+	if (num.exp > 1) {
+		for (k in seq(from=2, to=num.exp)) {
+			C_min <- min(C_min,min(TS.data[[k]]))
+		}
+	}
+	
+	alphas <- matrix(0.0, nrow=num.exp, ncol=num.genes)
+    colnames(alphas) <- gene.names
+	
+	for (k in seq(from=1, to=num.exp)) {
+		current.timeseries <- TS.data[[k]]
+		current.time.points <- time.points[[k]]
+		
+		for (target.gene.idx in seq(from=1, to=num.genes)) {
+			target.gene.name <- gene.names[target.gene.idx]
+			
+			idx.min <- which.min(current.timeseries[,target.gene.name])
+			idx.max <- which.max(current.timeseries[,target.gene.name])
+			
+			xmin <- current.timeseries[idx.min,target.gene.name]
+			xmax <- current.timeseries[idx.max,target.gene.name]
+			
+			tmin <- current.time.points[idx.min]
+			tmax <- current.time.points[idx.max]
+			
+            xmin <- max(xmin-C_min,1e-6)
+            xmax <- max(xmax-C_min,1e-6)
+			
+            xmin <- log(xmin)
+            xmax <- log(xmax)
+			
+			alphas[k,target.gene.name] = (xmax - xmin) / abs(tmin - tmax)		
+		}
+	}	
+	
+	alphas <- apply(alphas,2,max)
+	
+	return(alphas)
+}
+```
+
+
+### LIMPIAMOS LAS MATRICES VIPER
+```{r}
+TF_activity_auto <- as.data.frame(TF_activity_auto)
+rownames(TF_activity_auto) <- TF_activity_auto$X
+TF_activity_auto$X <- NULL
+TF_activity_auto[] <- lapply(TF_activity_auto, as.numeric)
+TF_activity_auto <- as.matrix(TF_activity_auto)
+
+TF_activity_mono <- as.data.frame(TF_activity_mono)
+rownames(TF_activity_mono) <- TF_activity_mono$X
+TF_activity_mono$X <- NULL
+TF_activity_mono[] <- lapply(TF_activity_mono, as.numeric)
+TF_activity_mono <- as.matrix(TF_activity_mono)
+```
+
+
+```{r}
+TFs_DA <- unique(c(TF_msVIPER_auto$x, TF_msVIPER_mono$x))
+
+TF_activity_autoDA <- matrix(0, nrow = length(TFs_DA), ncol = ncol(TF_activity_auto), dimnames = list(TFs_DA, colnames(TF_activity_auto)))
+TF_activity_monoDA <- matrix(0, nrow = length(TFs_DA), ncol = ncol(TF_activity_mono), dimnames = list(TFs_DA, colnames(TF_activity_mono)))
+
+
+genes_existentes_autoTFs <- intersect(TFs_DA, rownames(TF_activity_auto))
+genes_existentes_monoTFs <- intersect(TFs_DA, rownames(TF_activity_mono))
+
+
+TF_activity_autoDA[genes_existentes_autoTFs, ] <- as.matrix(TF_activity_auto[genes_existentes_autoTFs, ])
+TF_activity_monoDA[genes_existentes_monoTFs, ] <- as.matrix(TF_activity_mono[genes_existentes_monoTFs, ])
+
+
+TF_score_collectri_DA <- cbind(TF_activity_autoDA, TF_activity_monoDA)
+
+dim(TF_score_collectri_DA) 
+```
+
+```{r}
+dim(TF_activity_autoDA)
+dim(TF_activity_monoDA)
+
+all(rownames(TF_activity_autoDA) == TFs_DA)
+all(rownames(TF_activity_monoDA) == TFs_DA)
+
+length(genes_existentes_autoTFs)
+length(genes_existentes_monoTFs)
+
+setdiff(TFs_DA, rownames(TF_activity_auto))
+setdiff(TFs_DA, rownames(TF_activity_mono))
+```
+
+# Construir matrices dinámicas X e Y
+## MATRICES AUTOLOGOUS
+Preparamos los datos para AUTOLOGOUS
+```{r}
+# Generar processed_dataset
+processed_dataset <- process_TF_activity(
+  TF_activity = TF_activity_autoDA,
+  TFs_vector = TFs_DA,
+  sample_suffixes = c("p1_rep1_auto", "p1_rep2_auto", "p2_rep1_auto", "p2_rep2_auto", "p3_rep1_auto", "p3_rep2_auto")
+)
+
+# Definir la lista de puntos de tiempo correlativos a tus 6 réplicas/sufijos
+time.points_auto_p1 <- c(1, 4, 8, 11, 14)
+time.points <- list(time.points_auto_p1, time.points_auto_p1, time.points_auto_p1, 
+                    time.points_auto_p1, time.points_auto_p1, time.points_auto_p1)
+
+# Generar decay_rates
+decay_rates <- calculate_decay_rates(
+  normalized_data_list = processed_dataset$TF_activity_list, 
+  time_points_list = time.points
+)
+
+```
+
+
+
+
+```{r}
+# Definimos los parámetros iniciales
+h <- 1
+TS.data <- processed_dataset$TF_activity_list
+gene.names <- rownames(TS.data[[1]])
+num.genes <- length(gene.names)
+num.exp <- length(TS.data)
+
+
+input.gene.names <- processed_dataset$TFs_vector 
+num.input.genes <- length(input.gene.names)
+
+# tasas de degradación
+alphas <- rep(decay_rates$median, num.genes)
+alphas <- setNames(alphas, gene.names)
+
+# trasponemos la matriz
+TS.data.transposed <- lapply(TS.data, t)
+
+# reordenamos los puntos
+time.points.ordered <- time.points
+for (k in 1:num.exp) {
+  tp <- time.points[[k]]
+  tp_order <- order(tp)
+  time.points.ordered[[k]] <- tp[tp_order]
+  
+  expr.data <- TS.data.transposed[[k]]
+  TS.data.transposed[[k]] <- expr.data[tp_order, ]
+}
+
+num.samples.time <- 0
+for (k in 1:num.exp) {
+  num.samples.time <- num.samples.time + dim(TS.data.transposed[[k]])[1]
+}
+
+# inicializamos matrices vacías para X (input) e Y (output)
+input.matrix.time <- matrix(0.0, nrow = num.samples.time - h * num.exp, ncol = num.input.genes)
+output.matrix.time <- matrix(0.0, nrow = num.samples.time - h * num.exp, ncol = num.genes)
+
+# diferencias temporales y ecuación diferencial
+num.samples.count <- 0
+
+for (k in 1:num.exp) {
+  current.timeseries <- TS.data.transposed[[k]][, gene.names]
+  current.time.points <- time.points.ordered[[k]]
+  num.points <- length(current.time.points)
+  
+  # Diferencia de tiempo entre puntos consecutivos: t_(t+1) - t_t
+  time.diff.current <- current.time.points[(h+1):num.points] - current.time.points[1:(num.points-h)]
+  
+  # X (Input): Expresión en el tiempo t
+  current.timeseries.input <- current.timeseries[1:(num.points-h), input.gene.names]
+  
+  # Y (Output): Aproximación de la derivada dx/dt + alpha * x
+  current.timeseries.output <- (current.timeseries[(h+1):num.points, ] - current.timeseries[1:(num.points-h), ]) / 
+                               replicate(num.genes, time.diff.current) + 
+                               t(replicate((num.points-h), alphas)) * current.timeseries[1:(num.points-h), ]
+  
+  num.samples.current <- dim(current.timeseries.input)[1]
+  
+  # rellenamos las matrices de input y output
+  input.matrix.time[(num.samples.count+1):(num.samples.count+num.samples.current), ] <- current.timeseries.input
+  output.matrix.time[(num.samples.count+1):(num.samples.count+num.samples.current), ] <- current.timeseries.output
+  num.samples.count <- num.samples.count + num.samples.current
+}
+
+
+colnames(input.matrix.time) <- input.gene.names
+colnames(output.matrix.time) <- gene.names
+
+```
+
+
+Ahora añadimos los nombres correspondientes para que se parezcan a las matrices que teníamos
+```{r}
+# Definimos los puntos de tiempo para los nombres, sin añadir el último ya que es hasta el penúltimo
+tiempos_X <- c("D1", "D4", "D8", "D11")
+
+# añadimos el nombre de las réplicas
+replicas <- c("p1_rep1_auto", "p1_rep2_auto", 
+              "p2_rep1_auto", "p2_rep2_auto", 
+              "p3_rep1_auto", "p3_rep2_auto")
+
+
+nuevos_rownames <- as.vector(outer(tiempos_X, replicas, paste, sep = "_"))
+
+rownames(input.matrix.time) <- nuevos_rownames
+
+head(input.matrix.time[, 1:4])
+```
+
+
+Hacemos lo mismo para la matriz de output (Y):
+```{r}
+tiempos_X <- c("D1", "D4", "D8", "D11")
+
+replicas <- c("p1_rep1_auto", "p1_rep2_auto", 
+              "p2_rep1_auto", "p2_rep2_auto", 
+              "p3_rep1_auto", "p3_rep2_auto")
+
+nuevos_rownames <- as.vector(outer(tiempos_X, replicas, paste, sep = "_"))
+
+rownames(output.matrix.time) <- nuevos_rownames
+
+head(output.matrix.time[, 1:4])
+```
+
+## MATRICES AUTOLOGOUS
+
+Y ahora hacemos lo mismo para MONOCULTURE:
+
+```{r}
+processed_dataset <- process_TF_activity(
+  TF_activity =  TF_activity_monoDA,
+  TFs_vector = TFs_DA,
+  sample_suffixes = c("p1_rep1_B", "p1_rep2_B", "p2_rep1_B", "p2_rep2_B", "p3_rep1_B", "p3_rep2_B")
+)
+
+time.points_B_p1 <- c(1, 4, 8, 11, 14)
+time.points <- list(time.points_B_p1, time.points_B_p1, time.points_B_p1, 
+                    time.points_B_p1, time.points_B_p1, time.points_B_p1)
+
+decay_rates <- calculate_decay_rates(
+  normalized_data_list = processed_dataset$TF_activity_list, 
+  time_points_list = time.points
+)
+
+```
+
+
+```{r}
+# Definimos los parámetros iniciales
+h <- 1
+TS.data <- processed_dataset$TF_activity_list
+gene.names <- rownames(TS.data[[1]])
+num.genes <- length(gene.names)
+num.exp <- length(TS.data)
+
+input.gene.names <- processed_dataset$TFs_vector 
+num.input.genes <- length(input.gene.names)
+
+# tasas de degradación
+alphas <- rep(decay_rates$median, num.genes)
+alphas <- setNames(alphas, gene.names)
+
+# trasponemos la matriz
+TS.data.transposed <- lapply(TS.data, t)
+
+# reordenamos los puntos
+time.points.ordered <- time.points
+for (k in 1:num.exp) {
+  tp <- time.points[[k]]
+  tp_order <- order(tp)
+  time.points.ordered[[k]] <- tp[tp_order]
+  
+  expr.data <- TS.data.transposed[[k]]
+  TS.data.transposed[[k]] <- expr.data[tp_order, ]
+}
+
+
+num.samples.time <- 0
+for (k in 1:num.exp) {
+  num.samples.time <- num.samples.time + dim(TS.data.transposed[[k]])[1]
+}
+
+# inicializamos matrices vacías para X (input) e Y (output)
+input.matrix.time.B <- matrix(0.0, nrow = num.samples.time - h * num.exp, ncol = num.input.genes)
+output.matrix.time.B <- matrix(0.0, nrow = num.samples.time - h * num.exp, ncol = num.genes)
+
+# diferencias temporales y ecuación diferencial
+num.samples.count <- 0
+
+for (k in 1:num.exp) {
+  current.timeseries <- TS.data.transposed[[k]][, gene.names]
+  current.time.points <- time.points.ordered[[k]]
+  num.points <- length(current.time.points)
+  
+  # Diferencia de tiempo entre puntos consecutivos: t_(t+1) - t_t
+  time.diff.current <- current.time.points[(h+1):num.points] - current.time.points[1:(num.points-h)]
+  
+  # X (Input): Expresión en el tiempo t
+  current.timeseries.input <- current.timeseries[1:(num.points-h), input.gene.names]
+  
+  # Y (Output): Aproximación de la derivada dx/dt + alpha * x
+  current.timeseries.output <- (current.timeseries[(h+1):num.points, ] - current.timeseries[1:(num.points-h), ]) / 
+                               replicate(num.genes, time.diff.current) + 
+                               t(replicate((num.points-h), alphas)) * current.timeseries[1:(num.points-h), ]
+  
+  num.samples.current <- dim(current.timeseries.input)[1]
+  
+  # rellenamos las matrices de input y output
+  input.matrix.time.B[(num.samples.count+1):(num.samples.count+num.samples.current), ] <- current.timeseries.input
+  output.matrix.time.B[(num.samples.count+1):(num.samples.count+num.samples.current), ] <- current.timeseries.output
+  num.samples.count <- num.samples.count + num.samples.current
+}
+
+
+colnames(input.matrix.time.B) <- input.gene.names
+colnames(output.matrix.time.B) <- gene.names
+
+```
+
+
+```{r}
+tiempos_X <- c("D1", "D4", "D8", "D11")
+
+replicas <- c("p1_rep1_B", "p1_rep2_B", 
+              "p2_rep1_B", "p2_rep2_B", 
+              "p3_rep1_B", "p3_rep2_B")
+
+nuevos_rownames <- as.vector(outer(tiempos_X, replicas, paste, sep = "_"))
+
+rownames(input.matrix.time.B) <- nuevos_rownames
+
+head(input.matrix.time.B[, 1:4])
+```
+
+```{r}
+tiempos_X <- c("D1", "D4", "D8", "D11")
+
+replicas <- c("p1_rep1_B", "p1_rep2_B", 
+              "p2_rep1_B", "p2_rep2_B", 
+              "p3_rep1_B", "p3_rep2_B")
+
+
+nuevos_rownames <- as.vector(outer(tiempos_X, replicas, paste, sep = "_"))
+
+rownames(output.matrix.time.B) <- nuevos_rownames
+
+head(output.matrix.time.B[, 1:4])
+```
+
+Trasponemos las variables tanto X como Y:
+```{r}
+X_traspuesta_auto <- t(input.matrix.time)
+X_auto <- as.data.frame(X_traspuesta_auto)
+
+X_traspuesta_mono <- t(input.matrix.time.B)
+X_mono <- as.data.frame(X_traspuesta_mono)
+
+Y_traspuesta_auto <- t(output.matrix.time)
+Y_auto <- as.data.frame(Y_traspuesta_auto)
+
+Y_traspuesta_mono <- t(output.matrix.time.B)
+Y_mono <- as.data.frame(Y_traspuesta_mono)
+```
+```{r}
+dim(X_auto)
+dim(Y_auto)
+
+dim(X_mono)
+dim(Y_mono)
+```
+
+## TARGET DATA Y REGULATORY DATA
+
+Obtenemos ahora el targetData, condition, regulatoryData y associations para pasarselo a MORE:
+
+```{r}
+targetDataMORE_dynamic <- cbind(Y_auto, Y_mono)
+
+regulatoryDataMORE_dynamic <- list(
+  TF = cbind(X_auto, X_mono)
+)
+```
+
+```{r}
+dim(targetDataMORE_dynamic)
+dim(regulatoryDataMORE_dynamic$TF)
+
+all(colnames(targetDataMORE_dynamic) == colnames(regulatoryDataMORE_dynamic$TF))
+all(rownames(targetDataMORE_dynamic) == rownames(regulatoryDataMORE_dynamic$TF))
+```
+
+
+## CONDITION (METADATOS)
+
+```{r}
+library(stringr)
+sample_names <- colnames(targetDataMORE_dynamic)
+
+meta_MORE_dynamic <- data.frame(sample = sample_names) %>%
+  mutate(
+    condition = ifelse(sample %>% str_detect("auto"), "autologous", "monoculture"),
+    time      = str_extract(sample, "D\\d+"),          # D1, D4, D8, D11
+    patient   = str_extract(sample, "p\\d+"),          # p1, p2, p3 
+    replicate = str_extract(sample, "rep\\d+")         # rep1, rep2
+  )
+
+
+meta_MORE_dynamic
+```
+
+```{r}
+colnames(meta_MORE_dynamic)
+rownames(meta_MORE_dynamic) <- meta_MORE_dynamic$sample
+conditionMORE_dynamic <- meta_MORE_dynamic[colnames(targetDataMORE_dynamic), c("condition"), drop = FALSE]
+identical(rownames(conditionMORE_dynamic), colnames(targetDataMORE_dynamic))
+head(conditionMORE_dynamic)
+
+stopifnot(all(rownames(conditionMORE_dynamic) == colnames(targetDataMORE_dynamic)))
+```
+
+## ASOCIACIONES
+```{r}
+tf_names <- rownames(regulatoryDataMORE_dynamic$TF)
+gene_names <- rownames(targetDataMORE_dynamic)
+
+associations_TF <- collectri_net %>%
+  dplyr::select(target, source) %>%
+  dplyr::rename(TF = source) %>%
+  dplyr::filter(
+    TF %in% tf_names,
+    target %in% gene_names
+  ) %>%
+  distinct()
+
+dim(associations_TF)
+head(associations_TF)
+
+associations_TF <- as.data.frame(associations_TF, stringsAsFactors = FALSE)
+associations_TF[] <- lapply(associations_TF, as.character)
+
+associationsMORE_dynamic <- list(
+  TF = associations_TF
+)
+
+
+names(regulatoryDataMORE_dynamic)
+names(associationsMORE_dynamic)
+
+```
+
+Tenemos 650 relaciones de CollecTRI para los datos
+
+
+# APLICAMOS MORE
+
+### MLR
+Aplicamos MORE con MLR:
+```{r}
+set.seed(123) 
+
+moreDynamic_MLR <- more(
+  targetData = targetDataMORE_dynamic, 
+  regulatoryData = regulatoryDataMORE_dynamic,
+  associations = associationsMORE_dynamic,    
+  omicType = c(TF = 0),            
+  condition = conditionMORE_dynamic,           
+  minVariation = 0,                
+  percNA = 0.2,
+  scaleType = "auto",              
+  interactions = TRUE,             
+  varSel = "EN",                 
+  alfa = 0.05,
+  vip = 0.8,                       
+  method = "MLR",                 
+  parallel = FALSE,                
+  seed = 123
+)
+```
+
+```{r}
+summary(moreDynamic_MLR)
+```
+
+Miramos ahora las regulaciones significativas para cada modelo:
+```{r}
+reg_moreDynamicMLR <- RegulationPerCondition(moreDynamic_MLR)
+
+head(reg_moreDynamicMLR)
+dim(reg_moreDynamicMLR)
+```
+
+```{r}
+global_reg_dynamicMLR <- moreDynamic_MLR$GlobalSummary$GlobalRegulators
+global_reg_dynamicMLR
+```
+
+### PLS
+
+Aplicamos MORE con PLS:
+```{r}
+set.seed(123) 
+
+moreDynamic_PLS <- more(
+  targetData = targetDataMORE_dynamic, 
+  regulatoryData = regulatoryDataMORE_dynamic,
+  associations = associationsMORE_dynamic,    
+  omicType = c(TF = 0),            
+  condition = conditionMORE_dynamic,           
+  minVariation = 0,                
+  percNA = 0.2,
+  scaleType = "auto",              
+  interactions = TRUE,             
+  varSel = "Jack",                 
+  alfa = 0.05,
+  vip = 0.8,                       
+  method = "PLS1",                 
+  parallel = FALSE,                
+  seed = 123
+)
+```
+
+```{r}
+summary(moreDynamic_PLS)
+```
+
+
+
+```{r}
+reg_moreDynamicPLS <- RegulationPerCondition(moreDynamic_PLS)
+
+head(reg_moreDynamicPLS)
+dim(reg_moreDynamicPLS)
+```
+
+
+```{r}
+global_reg_dynamicPLS <- moreDynamic_PLS$GlobalSummary$GlobalRegulators
+global_reg_dynamicPLS
+```
+
+
+
+
+# COMPARACIÓN DE MÉTODOS
+
+```{r}
+n_reg_dynamicMLR <- nrow(reg_moreDynamicMLR)
+n_reg_dynamicPLS <- nrow(reg_moreDynamicPLS)
+
+n_reg_dynamicMLR
+n_reg_dynamicPLS
+```
+
+
+```{r}
+tabla_resumen_MOREdynamic <- data.frame(
+  Modelo = c("MORE naive MLR", "MORE naive PLS"),
+  Regulaciones_significativas = c(n_reg_dynamicMLR, n_reg_dynamicPLS)
+)
+
+tabla_resumen_MOREdynamic
+```
+
+
+```{r}
+
+r2_mlr_vec <- moreDynamic_MLR$GlobalSummary$GoodnessOfFit[, "Rsquared"]
+r2_pls_vec <- moreDynamic_PLS$GlobalSummary$GoodnessOfFit[, "RsquaredY"]
+
+df_r2 <- data.frame(
+  R2 = c(r2_mlr_vec, r2_pls_vec),
+  Metodo = rep(
+    c("MLR (ElasticNet)", "PLS (Jackknife)"), 
+    c(length(r2_mlr_vec), length(r2_pls_vec))
+  )
+)
+
+col_metodos <- c(
+  "MLR (ElasticNet)" = "#E5989B",
+  "PLS (Jackknife)" = "#5CC8C6"
+)
+
+p_r2_more_dynamic <- ggplot(df_r2, aes(x = Metodo, y = R2, fill = Metodo)) +
+  geom_boxplot(
+    alpha = 0.8,
+    outlier.color = "#4D4D4D",
+    width = 0.55
+  ) +
+  scale_fill_manual(values = col_metodos) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25)
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Comparación de la Bondad de Ajuste (R²)",
+    
+    y = expression(R^2),
+    x = ""
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "#4D4D4D"),
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+p_r2_more_dynamic
+
+rmse_mlr_dynamic <- moreDynamic_MLR$GlobalSummary$GoodnessOfFit[, "RMSE"]
+rmse_pls_dynamic <- moreDynamic_PLS$GlobalSummary$GoodnessOfFit[, "RMSE"]
+
+mean(rmse_mlr_dynamic)
+mean(rmse_pls_dynamic) 
+```
+
+```{r save_r2_plot, eval=FALSE}
+ggsave(
+  filename = file.path("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES/r2_MORE_dynamic.png"),
+  plot = p_r2_more_dynamic,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+
+# GRÁFICOS MLR
+
+
+Primero filtramos los TFs de interés que coinciden con los del paper y los de los resultados.
+
+```{r}
+tfs_interes_dynamic <- c(
+  "TP53", "SP1", "E2F1", "STAT1", "NFKB",
+  "HIF1A", "ETS1", "CEBPA", "CREB1",
+  "RUNX1", "NR3C1", "RBPJ"
+)
+
+subred_dynamic_MLR <- reg_moreDynamicMLR %>%
+  dplyr::filter(regulator %in% tfs_interes_dynamic)
+```
+
+Red de autologous
+```{r}
+networkMORE(
+  outputRegpcond = subred_dynamic_MLR,
+  cytoscape = TRUE,
+  group1 = "autologous",
+  pc = 0.1,
+  save = FALSE
+)
+```
+
+```{r}
+networkMORE(
+  outputRegpcond = subred_dynamic_MLR,
+  cytoscape = TRUE,
+  group1 = "monoculture",
+  pc = 0.1,
+  save = FALSE
+)
+```
+
+```{r}
+networkMORE(
+  outputRegpcond = subred_dynamic_MLR,
+  cytoscape = TRUE,
+  group1 = "monoculture",
+  group2 = "autologous",
+  pc = 0.1
+)
+```
+
+# Relaciones con mayor diferencia entre condiciones
+
+Ahora hacemos el plot temporal, pero primero escogemos las relaciones de interés:
+```{r}
+library(dplyr)
+
+relaciones_interes_dynamic <- reg_moreDynamicMLR %>%
+  mutate(
+    diff_cond = abs(Group_autologous - Group_monoculture),
+    cambio_signo = sign(Group_autologous) != sign(Group_monoculture),
+    abs_auto = abs(Group_autologous),
+    abs_mono = abs(Group_monoculture),
+    max_abs = pmax(abs_auto, abs_mono, na.rm = TRUE)
+  ) %>%
+  arrange(desc(diff_cond), desc(max_abs))
+
+head(relaciones_interes_dynamic, 30)
+```
+
+
+```{r}
+relaciones_interes_dynamic_filtradas <- relaciones_interes_dynamic %>%
+  filter(
+    regulator %in% tfs_interes_dynamic |
+    targetF %in% tfs_interes_dynamic
+  )
+
+head(relaciones_interes_dynamic_filtradas, 30)
+```
+
+```{r}
+relaciones_cambio_signo <- relaciones_interes_dynamic_filtradas %>%
+  filter(cambio_signo == TRUE) %>%
+  arrange(desc(max_abs))
+
+head(relaciones_cambio_signo, 20)
+```
+
+
+# PLOT MORE
+
+
+
+```{r}
+target_elegido <- "PRDM1"
+regulador_elegido <- "TP53"
+
+samples_more_dynamic <- colnames(targetDataMORE_dynamic)
+
+regu_vec_dynamic <- as.numeric(
+  regulatoryDataMORE_dynamic$TF[regulador_elegido, samples_more_dynamic]
+)
+names(regu_vec_dynamic) <- samples_more_dynamic
+
+time_vector_dynamic <- rep(c(1, 4, 8, 11), times = 12)
+names(time_vector_dynamic) <- samples_more_dynamic
+
+cond_vector_dynamic <- conditionMORE_dynamic[samples_more_dynamic, "condition"]
+names(cond_vector_dynamic) <- samples_more_dynamic
+
+TP53_PRD <- plotMORE(
+  output = moreDynamic_MLR,
+  targetF = target_elegido,
+  regulator = paste0("TF-", regulador_elegido),
+  reguValues = regu_vec_dynamic,
+  cont.var = time_vector_dynamic,
+  cond2plot = cond_vector_dynamic,
+  plotPerOmic = FALSE,
+  simplify = FALSE,
+  size = 13
+)
+```
+
+```{r}
+ggsave(
+  filename = file.path("C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES/plotMORE_TP53_PRDM1_dynamic.png"),
+  plot = TP53_PRD,
+  width = 7,
+  height = 5,
+  dpi = 300)
+```
+
+
+# COMPARACIÓN CON DYNGENIE3
+
+```{r}
+head(reg_moreDynamicMLR)
+dim(reg_moreDynamicMLR)
+head(reg_moreDynamicPLS)
+dim(reg_moreDynamicPLS)
+```
+
+
+```{r}
+library(dplyr)
+library(stringr)
+
+edges_MOREdynamic_MLR_auto <- reg_moreDynamicMLR %>%
+  dplyr::filter(!is.na(Group_autologous), Group_autologous != 0) %>%
+  dplyr::mutate(
+    regulator = stringr::str_remove(regulator, "^TF-"),
+    target = stringr::str_remove(targetF, "^TF-"),
+    edge = paste(regulator, target, sep = "->")
+  ) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = target,
+    condition = "autologous",
+    method = "MORE_dynamic_MLR",
+    effect = Group_autologous,
+    edge = edge
+  ) %>%
+  dplyr::distinct()
+dim(edges_MOREdynamic_MLR_auto)
+```
+
+```{r}
+edges_MOREdynamic_MLR_mono <- reg_moreDynamicMLR %>%
+  dplyr::filter(!is.na(Group_monoculture), Group_monoculture != 0) %>%
+  dplyr::mutate(
+    regulator = stringr::str_remove(regulator, "^TF-"),
+    target = stringr::str_remove(targetF, "^TF-"),
+    edge = paste(regulator, target, sep = "->")
+  ) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = target,
+    condition = "monoculture",
+    method = "MORE_dynamic_MLR",
+    effect = Group_monoculture,
+    edge = edge
+  ) %>%
+  dplyr::distinct()
+dim(edges_MOREdynamic_MLR_mono)
+```
+
+
+```{r}
+edges_MOREdynamic_MLR <- dplyr::bind_rows(
+  edges_MOREdynamic_MLR_auto,
+  edges_MOREdynamic_MLR_mono
+)
+
+head(edges_MOREdynamic_MLR)
+dim(edges_MOREdynamic_MLR)
+```
+
+```{r}
+edges_MOREdynamic_PLS_auto <- reg_moreDynamicPLS %>%
+  dplyr::filter(!is.na(Group_autologous), Group_autologous != 0) %>%
+  dplyr::mutate(
+    regulator = stringr::str_remove(regulator, "^TF-"),
+    target = stringr::str_remove(targetF, "^TF-"),
+    edge = paste(regulator, target, sep = "->")
+  ) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = target,
+    condition = "autologous",
+    method = "MORE_dynamic_PLS",
+    effect = Group_autologous,
+    edge = edge
+  ) %>%
+  dplyr::distinct()
+dim(edges_MOREdynamic_PLS_auto)
+```
+
+```{r}
+edges_MOREdynamic_PLS_mono <- reg_moreDynamicPLS %>%
+  dplyr::filter(!is.na(Group_monoculture), Group_monoculture != 0) %>%
+  dplyr::mutate(
+    regulator = stringr::str_remove(regulator, "^TF-"),
+    target = stringr::str_remove(targetF, "^TF-"),
+    edge = paste(regulator, target, sep = "->")
+  ) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = target,
+    condition = "monoculture",
+    method = "MORE_dynamic_PLS",
+    effect = Group_monoculture,
+    edge = edge
+  ) %>%
+  dplyr::distinct()
+dim(edges_MOREdynamic_PLS_mono)
+```
+
+
+```{r}
+edges_MOREdynamic_PLS <- dplyr::bind_rows(
+  edges_MOREdynamic_PLS_auto,
+  edges_MOREdynamic_PLS_mono
+)
+
+head(edges_MOREdynamic_PLS)
+dim(edges_MOREdynamic_PLS)
+```
+
+Comprobamos el número de relaciones por condición
+
+```{r}
+edges_MOREdynamic_MLR %>%
+  dplyr::count(condition, name = "n_edges_MLR")
+```
+
+```{r}
+edges_MOREdynamic_PLS %>%
+  dplyr::count(condition, name = "n_edges_PLS")
+```
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+
+limpiar_edges <- function(df, metodo_nombre) {
+  df %>%
+    mutate(
+      regulator = str_remove(regulator, "^TF-"),
+      target = str_remove(target, "^TF-"),
+      regulator = str_trim(regulator),
+      target = str_trim(target),
+      edge = paste(regulator, target, sep = "->"),
+      method = metodo_nombre
+    )
+}
+
+edges_dynamic_mlr <- limpiar_edges(
+  edges_MOREdynamic_MLR,
+  "MORE_dynamic_MLR"
+) %>%
+  filter(condition %in% c("autologous", "monoculture")) %>%
+  distinct(edge, condition, .keep_all = TRUE)
+```
+
+
+```{r}
+edges_dynamic_mlr %>%
+  count(condition, sort = TRUE)
+```
+
+```{r}
+edges_dyn_auto_clean <- edges_dyn_auto %>%
+  mutate(
+    regulator = str_remove(regulator, "^TF-"),
+    target = str_remove(target, "^TF-"),
+    regulator = str_trim(regulator),
+    target = str_trim(target),
+    edge = paste(regulator, target, sep = "->"),
+    condition = "autologous"
+  )
+
+edges_dyn_mono_clean <- edges_dyn_mono %>%
+  mutate(
+    regulator = str_remove(regulator, "^TF-"),
+    target = str_remove(target, "^TF-"),
+    regulator = str_trim(regulator),
+    target = str_trim(target),
+    edge = paste(regulator, target, sep = "->"),
+    condition = "monoculture"
+  )
+
+edges_dyn_all <- bind_rows(
+  edges_dyn_auto_clean,
+  edges_dyn_mono_clean
+) %>%
+  distinct(edge, condition, .keep_all = TRUE)
+```
+
+```{r}
+edges_dyn_all %>%
+  count(condition, sort = TRUE)
+```
+
+```{r}
+dynamic_mlr_not_dyn <- edges_dynamic_mlr %>%
+  anti_join(
+    edges_dyn_all %>% dplyr::select(edge, condition),
+    by = c("edge", "condition")
+  )
+```
+
+```{r}
+dynamic_mlr_not_dyn %>%
+  count(condition, sort = TRUE)
+```
+
+
+```{r}
+dynamic_mlr_not_dyn %>%
+  arrange(condition, desc(abs(effect))) %>%
+  dplyr::select(regulator, target, condition, method, effect, edge) %>%
+  head(30)
+```
+
+```{r}
+dynamic_mlr_resumen_cond <- dynamic_mlr_not_dyn %>%
+  dplyr::select(edge, regulator, target, condition, effect) %>%
+  pivot_wider(
+    names_from = condition,
+    values_from = effect,
+    names_prefix = "effect_"
+  ) %>%
+  mutate(
+    tipo = case_when(
+      !is.na(effect_autologous) & is.na(effect_monoculture) ~ "Específica de autologous",
+      is.na(effect_autologous) & !is.na(effect_monoculture) ~ "Específica de monoculture",
+      !is.na(effect_autologous) & !is.na(effect_monoculture) &
+        sign(effect_autologous) != sign(effect_monoculture) ~ "Compartida con cambio de signo",
+      !is.na(effect_autologous) & !is.na(effect_monoculture) ~ "Compartida en ambas condiciones",
+      TRUE ~ "Sin clasificar"
+    ),
+    max_abs_effect = pmax(
+      abs(effect_autologous),
+      abs(effect_monoculture),
+      na.rm = TRUE
+    )
+  ) %>%
+  arrange(desc(max_abs_effect))
+
+dynamic_mlr_resumen_cond %>%
+  head(30)
+```
+
+```{r}
+genes_interes <- c(
+  "TP53", "E2F1", "E2F2", "E2F5", "MYC",
+  "NFKB", "STAT1", "RUNX1", "ETS1", "CREB1",
+  "HIF1A", "FOXO1", "CEBPA", "CEBPD",
+  "PAX5", "IRF4", "IKZF1", "PRDM1", "EBF1", "BHLHE40",
+  "HOXA10", "ARID1B"
+)
+
+candidatas_dynamic_mlr <- dynamic_mlr_resumen_cond %>%
+  filter(regulator %in% genes_interes | target %in% genes_interes) %>%
+  mutate(
+    eje_biologico = case_when(
+      regulator %in% c("NFKB", "STAT1", "RUNX1", "ETS1", "CREB1") |
+        target %in% c("NFKB", "STAT1", "RUNX1", "ETS1", "CREB1") ~
+        "Señalización inmune / citoquinas",
+
+      regulator %in% c("TP53", "E2F1", "E2F2", "E2F5", "MYC") |
+        target %in% c("TP53", "E2F1", "E2F2", "E2F5", "MYC") ~
+        "Ciclo celular / proliferación / TP53",
+
+      regulator %in% c("HIF1A", "FOXO1", "CEBPA", "CEBPD") |
+        target %in% c("HIF1A", "FOXO1", "CEBPA", "CEBPD") ~
+        "Estrés / metabolismo / hipoxia",
+
+      regulator %in% c("PAX5", "IRF4", "IKZF1", "PRDM1", "EBF1", "BHLHE40", "HOXA10", "ARID1B") |
+        target %in% c("PAX5", "IRF4", "IKZF1", "PRDM1", "EBF1", "BHLHE40", "HOXA10", "ARID1B") ~
+        "Identidad B / diferenciación / plasticidad",
+
+      TRUE ~ "Otros"
+    )
+  ) %>%
+  arrange(desc(max_abs_effect))
+
+candidatas_dynamic_mlr %>%
+  dplyr::select(
+    edge,
+    regulator,
+    target,
+    effect_autologous,
+    effect_monoculture,
+    tipo,
+    max_abs_effect,
+    eje_biologico
+  ) %>%
+  head(30)
+```
+
+
+```{r}
+dynamic_mlr_shared_dyn <- edges_dynamic_mlr %>%
+  inner_join(
+    edges_dyn_all %>% dplyr::select(edge, condition),
+    by = c("edge", "condition")
+  )
+```
+
+```{r}
+dynamic_mlr_shared_dyn %>%
+  count(condition, sort = TRUE)
+```
+
+
+```{r}
+dyn_not_dynamic_mlr <- edges_dyn_all %>%
+  anti_join(
+    edges_dynamic_mlr %>% dplyr::select(edge, condition),
+    by = c("edge", "condition")
+  )
+```
+
+```{r}
+dyn_not_dynamic_mlr %>%
+  count(condition, sort = TRUE)
+```
+
+```{r}
+comparacion_dynamic_mlr <- tibble(
+  categoria = c(
+    "Compartidas",
+    "MORE_dynamic_MLR no detectadas por dynGENIE3",
+    "dynGENIE3 no detectadas por MORE_dynamic_MLR"
+  ),
+  n_autologous = c(
+    dynamic_mlr_shared_dyn %>% filter(condition == "autologous") %>% nrow(),
+    dynamic_mlr_not_dyn %>% filter(condition == "autologous") %>% nrow(),
+    dyn_not_dynamic_mlr %>% filter(condition == "autologous") %>% nrow()
+  ),
+  n_monoculture = c(
+    dynamic_mlr_shared_dyn %>% filter(condition == "monoculture") %>% nrow(),
+    dynamic_mlr_not_dyn %>% filter(condition == "monoculture") %>% nrow(),
+    dyn_not_dynamic_mlr %>% filter(condition == "monoculture") %>% nrow()
+  )
+)
+
+comparacion_dynamic_mlr
+```
+
+
+
+Comparamos MORE dynamic con dynGENIE3
+```{r}
+overlap_dynamic_MLR_dyn <- dplyr::inner_join(
+  edges_MOREdynamic_MLR,
+  edges_dyn,
+  by = c("edge", "condition"),
+  suffix = c("_MORE", "_dyn")
+)
+
+dim(overlap_dynamic_MLR_dyn)
+head(overlap_dynamic_MLR_dyn)
+```
+
+```{r}
+overlap_dynamic_PLS_dyn <- dplyr::inner_join(
+  edges_MOREdynamic_PLS,
+  edges_dyn,
+  by = c("edge", "condition"),
+  suffix = c("_MORE", "_dyn")
+)
+
+dim(overlap_dynamic_PLS_dyn)
+head(overlap_dynamic_PLS_dyn)
+```
+
+
+
+Tabla por condición
+```{r}
+resumen_por_condicion <- function(edges_more, edges_dyn, overlap, nombre_modelo) {
+  
+  n_more <- edges_more %>%
+    dplyr::count(condition, name = "Relaciones_MORE")
+  
+  n_dyn <- edges_dyn %>%
+    dplyr::count(condition, name = "Relaciones_dynGENIE3")
+  
+  n_overlap <- overlap %>%
+    dplyr::count(condition, name = "Relaciones_compartidas")
+  
+  n_more %>%
+    dplyr::left_join(n_dyn, by = "condition") %>%
+    dplyr::left_join(n_overlap, by = "condition") %>%
+    dplyr::mutate(
+      Relaciones_compartidas = tidyr::replace_na(Relaciones_compartidas, 0),
+      Porcentaje_sobre_MORE = round(Relaciones_compartidas / Relaciones_MORE * 100, 2),
+      Porcentaje_sobre_dynGENIE3 = round(Relaciones_compartidas / Relaciones_dynGENIE3 * 100, 2),
+      Modelo = nombre_modelo
+    ) %>%
+    dplyr::select(
+      Modelo,
+      condition,
+      Relaciones_MORE,
+      Relaciones_dynGENIE3,
+      Relaciones_compartidas,
+      Porcentaje_sobre_MORE,
+      Porcentaje_sobre_dynGENIE3
+    )
+}
+```
+
+```{r}
+tabla_dynamic_MLR_dyn_condition <- resumen_por_condicion(
+  edges_more = edges_MOREdynamic_MLR,
+  edges_dyn = edges_dyn,
+  overlap = overlap_dynamic_MLR_dyn,
+  nombre_modelo = "MORE dynamic MLR"
+)
+
+tabla_dynamic_PLS_dyn_condition <- resumen_por_condicion(
+  edges_more = edges_MOREdynamic_PLS,
+  edges_dyn = edges_dyn,
+  overlap = overlap_dynamic_PLS_dyn,
+  nombre_modelo = "MORE dynamic PLS"
+)
+
+tabla_dynamic_dyn_condition <- dplyr::bind_rows(
+  tabla_dynamic_MLR_dyn_condition,
+  tabla_dynamic_PLS_dyn_condition
+)
+
+tabla_dynamic_dyn_condition
+```
+
+Relaciones compartidas:
+```{r}
+overlap_dynamic_MLR_dyn %>%
+  dplyr::arrange(dplyr::desc(weight_mean)) %>%
+  dplyr::select(
+    condition,
+    regulator_MORE,
+    target_MORE,
+    effect,
+    weight_mean,
+    weight_sd
+  ) %>%
+  head(20)
+```
+
+```{r}
+overlap_dynamic_PLS_dyn %>%
+  dplyr::arrange(dplyr::desc(weight_mean)) %>%
+  dplyr::select(
+    condition,
+    regulator_MORE,
+    target_MORE,
+    effect,
+    weight_mean,
+    weight_sd
+  ) %>%
+  head(20)
+```
+
+
+
+

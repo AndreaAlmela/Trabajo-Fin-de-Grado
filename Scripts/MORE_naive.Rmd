@@ -1,0 +1,1049 @@
+---
+title: "MORE_naive2"
+author: "Andrea"
+date: "2026-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# LIBRERÍAS 
+
+```{r}
+# Librerías principales para aplicar MORE y cargar CollecTRI
+library(MORE)
+library(decoupleR)
+
+# Manipulación y visualización de datos
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+
+# Dependencias utilizadas por MORE
+library(ropls)
+library(furrr)
+library(purrr)
+library(igraph)
+library(ltm)
+library(psych)
+library(MASS)
+library(glmnet)
+library(car)
+```
+
+
+
+# PREPARACIÓN DATOS DE ENTRADA
+
+## CARGA DE DATOS
+
+Cargamos la red COllecTRI:
+```{r}
+# Ruta base local del proyecto
+ruta_base <- "/Users/andya/Escritorio/TFG"
+ruta_datos <- file.path(ruta_base, "Datos")
+ruta_figuras <- file.path(ruta_base, "IMAGENES")
+
+# Cargamos la red reguladora CollecTRI.
+# Esta red se utiliza para definir las asociaciones conocidas TF-target.
+collectri_net <- decoupleR::get_collectri(
+  organism = "human",
+  split_complexes = FALSE
+)
+
+# Cargamos las actividades de los factores de transcripción estimadas con VIPER.
+# Estas matrices se utilizarán como regulatoryData en MORE.
+TF_activity_auto <- read.csv(file.path(ruta_datos, "auto_TF_score_collectri.csv"))
+TF_activity_mono <- read.csv(file.path(ruta_datos, "mono_TF_score_collectri.csv"))
+
+# Cargamos los TFs diferencialmente activos identificados con msVIPER.
+TF_msVIPER_auto <- read.csv(file.path(ruta_datos, "msViper_auto_TFs.csv"))
+TF_msVIPER_mono <- read.csv(file.path(ruta_datos, "msViper_mono_TFs.csv"))
+
+# Cargamos los resultados de dynGENIE3 para compararlos posteriormente con MORE.
+dynGENIE3_auto <- read.csv(file.path(ruta_datos, "GRN_auto_withTFs_msViper_TFs_001.csv"))
+dynGENIE3_mono <- read.csv(file.path(ruta_datos, "GRN_mono_withTFs_msViper_TFs_001.csv"))
+```
+
+
+
+# PREPARACIÓN MATRICES `targetData` y `regulatoryData`
+
+```{r}
+# Unión de TFs diferencialmente activos identificados con msVIPER
+TFs_msViper <- unique(c(TF_msVIPER_auto$x, TF_msVIPER_mono$x))
+length(TFs_msViper)
+```
+
+```{r}
+TF_activity_auto <- as.data.frame(TF_activity_auto)
+rownames(TF_activity_auto) <- TF_activity_auto$X
+TF_activity_auto$X <- NULL
+TF_activity_auto[] <- lapply(TF_activity_auto, as.numeric)
+TF_activity_auto <- as.matrix(TF_activity_auto)
+```
+
+```{r}
+TF_activity_mono <- as.data.frame(TF_activity_mono)
+rownames(TF_activity_mono) <- TF_activity_mono$X
+TF_activity_mono$X <- NULL
+TF_activity_mono[] <- lapply(TF_activity_mono, as.numeric)
+TF_activity_mono <- as.matrix(TF_activity_mono)
+```
+
+```{r}
+# Creamos una matriz para autologous con todos los TFs diferencialmente activos.
+# Los TFs que no estén presentes en la matriz VIPER se rellenan con cero.
+autoTFs_completo_da <- matrix(0, nrow = length(TFs_msViper), ncol = ncol(TF_activity_auto),
+                           dimnames = list(TFs_msViper, colnames(TF_activity_auto)))
+
+monoTFs_completo_da <- matrix(0, nrow = length(TFs_msViper), ncol = ncol(TF_activity_mono),
+                           dimnames = list(TFs_msViper, colnames(TF_activity_mono)))
+
+# Identificamos qué TFs diferencialmente activos están presentes en cada condición.
+genes_existentes_autoTFs <- intersect(TFs_msViper, rownames(TF_activity_auto))
+genes_existentes_monoTFs <- intersect(TFs_msViper, rownames(TF_activity_mono))
+
+# Rellenamos las matrices con los valores reales disponibles.
+autoTFs_completo_da[genes_existentes_autoTFs, ] <- as.matrix(TF_activity_auto[genes_existentes_autoTFs, ])
+monoTFs_completo_da[genes_existentes_monoTFs, ] <- as.matrix(TF_activity_mono[genes_existentes_monoTFs, ])
+
+# Unimos ambas condiciones en una única matriz de actividad reguladora.
+TF_score_collectri_DA <- cbind(autoTFs_completo_da, monoTFs_completo_da)
+
+dim(TF_score_collectri_DA) 
+```
+
+
+Una vez obtenida la matriz conjunta de actividad reguladora vamos a construir las matrices de `targetData`y `regulatoryData`
+
+```{r}
+# En el enfoque MORE naive usamos la matriz de actividad de TFs
+# tanto como targetData como regulatoryData.
+
+targetData_DA <- TF_score_collectri_DA
+
+regulatoryDataDA <- list(TF=TF_score_collectri_DA)
+
+# Comprobamos que ambas matrices están alineadas.
+dim(targetData_DA)
+dim(regulatoryDataDA$TF)
+
+identical(rownames(targetData_DA), rownames(regulatoryDataDA$TF))
+identical(colnames(targetData_DA), colnames(regulatoryDataDA$TF))
+```
+
+
+# CONDITION
+
+Construimos la matriz de condición
+
+```{r}
+sample_names <- colnames(targetData_DA)
+
+meta <- data.frame(sample = sample_names) %>%
+  mutate(
+    condition = ifelse(sample %>% str_detect("auto"), "autologous", "monoculture"),
+    time      = str_extract(sample, "D\\d+"),          # D1, D4, D8, D11, D14
+    patient   = str_extract(sample, "p\\d+"),          # p1, p2, p3 
+    replicate = str_extract(sample, "rep\\d+")         # rep1, rep2
+  )
+
+meta$time <- factor(meta$time,
+                    levels = c("D1", "D4", "D8", "D11", "D14"))
+
+meta
+```
+
+```{r}
+# Ponemos sample como rownames si no lo está ya
+rownames(meta) <- meta$sample
+
+# Reordenamos meta según las columnas de targetData
+condition <- meta[colnames(targetData_DA), c("condition"), drop = FALSE]
+
+# Comprobamos que coincide el orden
+identical(rownames(condition), colnames(targetData_DA))
+
+head(condition)
+```
+
+
+# ASSOCITATIONS
+
+Ahora vamos a crear associations con la red de CollecTRI.
+
+```{r}
+tf_names <- rownames(regulatoryDataDA$TF)
+target_names <- rownames(targetData_DA)
+
+associations_TF <- collectri_net %>%
+  dplyr::select(target, source) %>%
+  dplyr::rename(TF = source) %>%
+  dplyr::filter(
+    TF %in% tf_names,
+    target %in% target_names,
+    TF != target # importante para que no se autorregule
+  ) %>%
+  distinct()
+
+dim(associations_TF)
+head(associations_TF)
+
+associations_TF <- as.data.frame(associations_TF, stringsAsFactors = FALSE)
+associations_TF[] <- lapply(associations_TF, as.character)
+
+associations <- list(
+  TF = associations_TF
+)
+
+```
+
+Hemos obtenido 650 regulaciones que se encuentran en CollecTRI.
+
+```{r}
+var_reg <- apply(regulatoryDataDA$TF, 1, var, na.rm = TRUE)
+
+summary(var_reg)
+sum(var_reg == 0)
+names(var_reg[var_reg == 0])
+```
+
+# APLICAMOS MORE
+
+### MLR
+Aplicamos MORE con MLR:
+```{r}
+set.seed(123) 
+
+moreNaiveDA_MLR <- more(
+  targetData = targetData_DA, 
+  regulatoryData = regulatoryDataDA,
+  associations = associations,    
+  omicType = c(TF = 0),            
+  condition = condition,           
+  minVariation = 0,                
+  percNA = 0.2,
+  scaleType = "auto",              
+  interactions = TRUE,             
+  varSel = "EN",                 
+  alfa = 0.05,
+  vip = 0.8,                       
+  method = "MLR",                 
+  parallel = FALSE,                
+  seed = 123
+)
+```
+```{r}
+summary(moreNaiveDA_MLR)
+```
+
+Miramos ahora las regulaciones significativas para cada modelo:
+```{r}
+reg_moreNaiveMLR <- RegulationPerCondition(moreNaiveDA_MLR)
+
+head(reg_moreNaiveMLR)
+dim(reg_moreNaiveMLR)
+```
+
+Obtenemos 629 regulaciones significativas con MORE y MLR.
+
+```{r}
+global_reg_MLR <- moreNaiveDA_MLR$GlobalSummary$GlobalRegulators
+global_reg_MLR
+```
+
+### PLS
+
+Aplicamos MORE con PLS:
+```{r}
+set.seed(123) 
+
+moreNaiveDA_PLS <- more(
+  targetData = targetData_DA, 
+  regulatoryData = regulatoryDataDA,
+  associations = associations,    
+  omicType = c(TF = 0),            
+  condition = condition,           
+  minVariation = 0,                
+  percNA = 0.2,
+  scaleType = "auto",              
+  interactions = TRUE,             
+  varSel = "Jack",                 
+  alfa = 0.05,
+  vip = 0.8,                       
+  method = "PLS1",                 
+  parallel = FALSE,                
+  seed = 123
+)
+```
+
+
+
+
+
+
+
+```{r}
+summary(moreNaiveDA_PLS)
+```
+
+
+
+
+```{r}
+reg_moreNaivePLS <- RegulationPerCondition(moreNaiveDA_PLS)
+
+head(reg_moreNaivePLS)
+dim(reg_moreNaivePLS)
+```
+
+Hemos obtenido 471 regulaciones significativas con PLS.
+
+```{r}
+global_reg_PLS <- moreNaiveDA_PLS$GlobalSummary$GlobalRegulators
+global_reg_PLS
+```
+
+
+
+
+
+# COMPARACIÓN DE MÉTODOS
+
+```{r}
+n_reg_MLR <- nrow(reg_moreNaiveMLR)
+n_reg_PLS <- nrow(reg_moreNaivePLS)
+
+n_reg_MLR
+n_reg_PLS
+```
+
+
+```{r}
+tabla_resumen_MORE <- data.frame(
+  Modelo = c("MORE naive MLR", "MORE naive PLS"),
+  Regulaciones_significativas = c(n_reg_MLR, n_reg_PLS)
+)
+
+tabla_resumen_MORE
+```
+
+R^2
+
+```{r}
+r2_mlr_vec <- moreNaiveDA_MLR$GlobalSummary$GoodnessOfFit[, "Rsquared"]
+r2_pls_vec <- moreNaiveDA_PLS$GlobalSummary$GoodnessOfFit[, "RsquaredY"]
+
+df_r2 <- data.frame(
+  R2 = c(r2_mlr_vec, r2_pls_vec),
+  Metodo = rep(
+    c("MLR (ElasticNet)", "PLS (Jackknife)"), 
+    c(length(r2_mlr_vec), length(r2_pls_vec))
+  )
+)
+
+col_metodos <- c(
+  "MLR (ElasticNet)" = "#E5989B",
+  "PLS (Jackknife)" = "#5CC8C6"
+)
+
+p_r2_more_naive <- ggplot(df_r2, aes(x = Metodo, y = R2, fill = Metodo)) +
+  geom_boxplot(
+    alpha = 0.8,
+    outlier.color = "#4D4D4D",
+    width = 0.55
+  ) +
+  scale_fill_manual(values = col_metodos) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25)
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Comparación de la Bondad de Ajuste (R²)",
+    
+    y = expression(R^2),
+    x = ""
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "#4D4D4D"),
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+p_r2_more_naive
+```
+
+```{r}
+ruta_figuras <- "C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES"
+
+ggsave(
+  filename = file.path(ruta_figuras, "r2_more_naive_DA.png"),
+  plot = p_r2_more_naive,
+  width = 7,
+  height = 4.5,
+  dpi = 300,
+  bg = "white"
+)
+```
+
+```{r}
+
+rmse_mlr <- moreNaiveDA_MLR$GlobalSummary$GoodnessOfFit[, "RMSE"]
+rmse_pls <- moreNaiveDA_PLS$GlobalSummary$GoodnessOfFit[, "RMSE"]
+
+
+mean(rmse_mlr)
+mean(rmse_pls) 
+```
+```{r}
+r2_mlr <- moreNaiveDA_MLR$GlobalSummary$GoodnessOfFit[, "Rsquared"]
+r2_pls <- moreNaiveDA_PLS$GlobalSummary$GoodnessOfFit[, "RsquaredY"]
+
+
+mean(r2_mlr)
+mean(r2_pls) 
+```
+
+# GRÁFICOS CON MRL
+
+
+Primero filtramos los TFs de interés que coinciden con los del paper y los de los resultados.
+
+```{r}
+tfs_interes <- c(
+  "TP53", "E2F1", "MYC", "NFKB", "RELA",
+  "STAT1", "CEBPA", "HIF1A", "SP1",
+  "ETS1", "RUNX1", "NR3C1", "CREB1"
+)
+```
+
+```{r}
+subred_DA_MLR <- reg_moreNaiveMLR %>%
+  dplyr::filter(regulator %in% tfs_interes)
+```
+
+
+
+Red de autologous
+```{r}
+networkMORE(
+  outputRegpcond = subred_DA_MLR,
+  cytoscape = TRUE,
+  group1 = "autologous",
+  pc = 0.1,
+  save = FALSE
+)
+```
+
+```{r}
+networkMORE(
+  outputRegpcond = subred_DA_MLR,
+  cytoscape = TRUE,
+  group1 = "monoculture",
+  pc = 0.1,
+  save = FALSE
+)
+```
+
+```{r}
+networkMORE(
+  outputRegpcond = subred_DA_MLR,
+  cytoscape = TRUE,
+  group1 = "monoculture",
+  group2 = "autologous",
+  pc = 0.1
+)
+```
+
+# PLOT TEMPORAL
+Ahora hacemos el plot temporal, pero primero escogemos las relaciones de interés:
+```{r}
+library(dplyr)
+
+relaciones_interes_DA <- reg_moreNaiveMLR %>%
+  mutate(
+    diff_cond = abs(Group_autologous - Group_monoculture),
+    cambio_signo = sign(Group_autologous) != sign(Group_monoculture),
+    abs_auto = abs(Group_autologous),
+    abs_mono = abs(Group_monoculture),
+    max_abs = pmax(abs_auto, abs_mono, na.rm = TRUE)
+  ) %>%
+  arrange(desc(diff_cond), desc(max_abs))
+
+head(relaciones_interes_DA, 30)
+```
+
+```{r}
+tfs_interes <- c(
+  "TP53", "MYC", "E2F1", "NFKB", "RELA",
+  "STAT1", "CEBPA", "HIF1A", "SP1",
+  "ETS1", "RUNX1", "NR3C1", "CREB1"
+)
+
+relaciones_interes_DA_filtradas <- relaciones_interes_DA %>%
+  filter(
+    regulator %in% tfs_interes |
+    targetF %in% tfs_interes
+  )
+
+head(relaciones_interes_DA_filtradas, 30)
+```
+
+```{r}
+relaciones_cambio_signo <- relaciones_interes_DA %>%
+  filter(cambio_signo == TRUE) %>%
+  arrange(desc(max_abs))
+
+head(relaciones_cambio_signo, 20)
+```
+
+
+```{r}
+target_elegido <- "HOXA10"
+regulador_elegido <- "TP53"
+
+samples_more <- colnames(targetData_DA)
+
+regu_vec <- as.numeric(regulatoryDataDA$TF[regulador_elegido, samples_more])
+names(regu_vec) <- samples_more
+
+time_vector <- rep(c(1, 4, 8, 11, 14), times = 12)
+names(time_vector) <- samples_more
+
+cond_vector <- condition[samples_more, "condition"]
+names(cond_vector) <- samples_more
+
+p_tp53_hoxa10 <- plotMORE(
+  output = moreNaiveDA_MLR,
+  targetF = target_elegido,
+  regulator = paste0("TF-", regulador_elegido),
+  reguValues = regu_vec,
+  cont.var = time_vector,
+  cond2plot = cond_vector,
+  plotPerOmic = FALSE,
+  simplify = FALSE,
+  size = 13
+)
+```
+
+```{r}
+
+ggsave(
+  filename = "C:/Users/andya/OneDrive/Escritorio/CDatos/TFG/IMAGENES/plotMORE_TP53_HOXA10_naive.png",
+  plot = p_tp53_hoxa10,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+
+# PREPARAMOS MATRICES DYNGENIE3 Y COMPARAMOS 
+
+```{r}
+weight_cols <- grep("^weight", colnames(dynGENIE3_auto), value = TRUE)
+
+edges_dyn_auto <- dynGENIE3_auto %>%
+  mutate(
+    weight_mean = rowMeans(dplyr::select(., all_of(weight_cols)), na.rm = TRUE),
+    weight_sd = apply(dplyr::select(., all_of(weight_cols)), 1, sd, na.rm = TRUE)
+  ) %>%
+  transmute(
+    regulator = regulatory.gene,
+    target = target.gene,
+    condition = "autologous",
+    method = "dynGENIE3",
+    weight_mean = weight_mean,
+    weight_sd = weight_sd
+  ) %>%
+  distinct()
+
+head(edges_dyn_auto)
+```
+
+
+```{r}
+
+weight_cols <- grep("^weight", colnames(dynGENIE3_mono), value = TRUE)
+
+edges_dyn_mono <- dynGENIE3_mono %>%
+  mutate(
+    weight_mean = rowMeans(dplyr::select(., all_of(weight_cols)), na.rm = TRUE),
+    weight_sd = apply(dplyr::select(., all_of(weight_cols)), 1, sd, na.rm = TRUE)
+  ) %>%
+  transmute(
+    regulator = regulatory.gene,
+    target = target.gene,
+    condition = "monoculture",
+    method = "dynGENIE3",
+    weight_mean = weight_mean,
+    weight_sd = weight_sd
+  ) %>%
+  distinct()
+
+head(edges_dyn_mono)
+```
+
+
+```{r}
+edges_dyn <- dplyr::bind_rows(edges_dyn_auto, edges_dyn_mono)
+head(edges_dyn)
+```
+
+
+```{r}
+edges_MORE_MLR_auto <- reg_moreNaiveMLR %>%
+  dplyr::filter(!is.na(Group_autologous), Group_autologous != 0) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = targetF,
+    condition = "autologous",
+    method = "MORE_MLR",
+    effect = Group_autologous
+  ) %>%
+  dplyr::distinct()
+
+dim(edges_MORE_MLR_auto)
+```
+
+
+```{r}
+edges_MORE_PLS_auto <- reg_moreNaivePLS %>%
+  dplyr::filter(!is.na(Group_autologous), Group_autologous != 0) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = targetF,
+    condition = "autologous",
+    method = "MORE_PLS",
+    effect = Group_autologous
+  ) %>%
+  dplyr::distinct()
+dim(edges_MORE_PLS_auto)
+```
+
+```{r}
+edges_MORE_PLS_mono <- reg_moreNaivePLS%>%
+  dplyr::filter(!is.na(Group_monoculture), Group_monoculture != 0) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = targetF,
+    condition = "monoculture",
+    method = "MORE_PLS",
+    effect = Group_monoculture
+  ) %>%
+  dplyr::distinct()
+```
+
+
+```{r}
+edges_MORE_MLR_mono <- reg_moreNaiveMLR %>%
+  dplyr::filter(!is.na(Group_monoculture), Group_monoculture != 0) %>%
+  dplyr::transmute(
+    regulator = regulator,
+    target = targetF,
+    condition = "monoculture",
+    method = "MORE_MLR",
+    effect = Group_monoculture
+  ) %>%
+  dplyr::distinct()
+```
+
+```{r}
+dim(edges_MORE_MLR_auto)
+dim(edges_MORE_MLR_mono)
+dim(edges_MORE_PLS_auto)
+dim(edges_MORE_PLS_mono)
+```
+
+
+
+Ahora unimos:
+```{r}
+edges_MORE_MLR <- dplyr::bind_rows(
+  edges_MORE_MLR_auto,
+  edges_MORE_MLR_mono
+)
+
+edges_MORE_PLS <- dplyr::bind_rows(
+  edges_MORE_PLS_auto,
+  edges_MORE_PLS_mono
+)
+
+head(edges_MORE_MLR)
+head(edges_MORE_PLS)
+```
+
+
+
+MLR vs dynGENIE3
+
+```{r}
+overlap_MLR_dyn <- dplyr::inner_join(
+  edges_MORE_MLR,
+  edges_dyn,
+  by = c("regulator", "target", "condition")
+)
+head(overlap_MLR_dyn)
+dim(overlap_MLR_dyn)
+```
+
+```{r}
+overlap_PLS_dyn <- dplyr::inner_join(
+  edges_MORE_PLS,
+  edges_dyn,
+  by = c("regulator", "target", "condition")
+)
+
+head(overlap_PLS_dyn)
+dim(overlap_PLS_dyn)
+```
+
+```{r}
+tabla_dyn_global <- data.frame(
+  Comparacion = c(
+    "MORE MLR vs dynGENIE3",
+    "MORE PLS vs dynGENIE3"
+  ),
+  Relaciones_MORE = c(
+    nrow(edges_MORE_MLR),
+    nrow(edges_MORE_PLS)
+  ),
+  Relaciones_dynGENIE3 = c(
+    nrow(edges_dyn),
+    nrow(edges_dyn)
+  ),
+  Relaciones_compartidas = c(
+    nrow(overlap_MLR_dyn),
+    nrow(overlap_PLS_dyn)
+  ),
+  Porcentaje_sobre_MORE = c(
+    nrow(overlap_MLR_dyn) / nrow(edges_MORE_MLR) * 100,
+    nrow(overlap_PLS_dyn) / nrow(edges_MORE_PLS) * 100
+  ),
+  Porcentaje_sobre_dynGENIE3 = c(
+    nrow(overlap_MLR_dyn) / nrow(edges_dyn) * 100,
+    nrow(overlap_PLS_dyn) / nrow(edges_dyn) * 100
+  )
+)
+
+tabla_dyn_global
+```
+
+
+Y ahora vemos resumen por condición (`autologous` y `monoculture`)
+
+```{r}
+resumen_por_condicion <- function(edges_more, edges_dyn, overlap, nombre_modelo) {
+  
+  n_more <- edges_more %>%
+    dplyr::count(condition, name = "Relaciones_MORE")
+  
+  n_dyn <- edges_dyn %>%
+    dplyr::count(condition, name = "Relaciones_dynGENIE3")
+  
+  n_overlap <- overlap %>%
+    dplyr::count(condition, name = "Relaciones_compartidas")
+  
+  n_more %>%
+    dplyr::left_join(n_dyn, by = "condition") %>%
+    dplyr::left_join(n_overlap, by = "condition") %>%
+    dplyr::mutate(
+      Relaciones_compartidas = tidyr::replace_na(Relaciones_compartidas, 0),
+      Porcentaje_sobre_MORE = Relaciones_compartidas / Relaciones_MORE * 100,
+      Porcentaje_sobre_dynGENIE3 = Relaciones_compartidas / Relaciones_dynGENIE3 * 100,
+      Modelo = nombre_modelo
+    ) %>%
+    dplyr::select(
+      Modelo,
+      condition,
+      Relaciones_MORE,
+      Relaciones_dynGENIE3,
+      Relaciones_compartidas,
+      Porcentaje_sobre_MORE,
+      Porcentaje_sobre_dynGENIE3
+    )
+}
+```
+
+```{r}
+tabla_MLR_dyn_condition <- resumen_por_condicion(
+  edges_more = edges_MORE_MLR,
+  edges_dyn = edges_dyn,
+  overlap = overlap_MLR_dyn,
+  nombre_modelo = "MORE MLR"
+)
+
+tabla_PLS_dyn_condition <- resumen_por_condicion(
+  edges_more = edges_MORE_PLS,
+  edges_dyn = edges_dyn,
+  overlap = overlap_PLS_dyn,
+  nombre_modelo = "MORE PLS"
+)
+
+tabla_dyn_condition <- dplyr::bind_rows(
+  tabla_MLR_dyn_condition,
+  tabla_PLS_dyn_condition
+)
+
+tabla_dyn_condition
+```
+```{r}
+overlap_MLR_dyn %>%
+  dplyr::arrange(dplyr::desc(weight_mean)) %>%
+  dplyr::select(
+    condition,
+    regulator,
+    target,
+    effect,
+    weight_mean,
+    weight_sd
+  ) %>%
+  head(20)
+```
+
+
+```{r}
+overlap_PLS_dyn %>%
+  dplyr::arrange(dplyr::desc(weight_mean)) %>%
+  dplyr::select(
+    condition,
+    regulator,
+    target,
+    effect,
+    weight_mean,
+    weight_sd
+  ) %>%
+  head(20)
+```
+
+
+# CÓDIGO NUEVO
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+
+limpiar_edges <- function(df, metodo_nombre) {
+  df %>%
+    mutate(
+      regulator = str_remove(regulator, "^TF-"),
+      target = str_remove(target, "^TF-"),
+      regulator = str_trim(regulator),
+      target = str_trim(target),
+      edge = paste(regulator, target, sep = "->"),
+      method = metodo_nombre
+    )
+}
+
+edges_naive_mlr <- limpiar_edges(
+  edges_MORE_MLR,
+  "MORE_naive_MLR"
+) %>%
+  filter(condition %in% c("autologous", "monoculture")) %>%
+  distinct(edge, condition, .keep_all = TRUE)
+```
+
+```{r}
+edges_naive_mlr %>%
+  count(condition, sort = TRUE)
+```
+
+
+```{r}
+naive_mlr_not_dyn <- edges_naive_mlr %>%
+  anti_join(
+    edges_dyn_all %>% dplyr::select(edge, condition),
+    by = c("edge", "condition")
+  )
+```
+
+```{r}
+naive_mlr_not_dyn %>%
+  count(condition, sort = TRUE)
+```
+
+
+```{r}
+naive_mlr_not_dyn %>%
+  arrange(condition, desc(abs(effect))) %>%
+  dplyr::select(regulator, target, condition, method, effect, edge) %>%
+  head(30)
+```
+
+
+```{r}
+naive_mlr_shared_dyn <- edges_naive_mlr %>%
+  inner_join(
+    edges_dyn_all %>% dplyr::select(edge, condition),
+    by = c("edge", "condition")
+  )
+
+naive_mlr_shared_dyn %>%
+  count(condition, sort = TRUE)
+```
+
+```{r}
+dyn_not_naive_mlr <- edges_dyn_all %>%
+  anti_join(
+    edges_naive_mlr %>% dplyr::select(edge, condition),
+    by = c("edge", "condition")
+  )
+
+dyn_not_naive_mlr %>%
+  count(condition, sort = TRUE)
+```
+```{r}
+comparacion_naive_mlr <- tibble(
+  categoria = c(
+    "Compartidas",
+    "MORE_naive_MLR no detectadas por dynGENIE3",
+    "dynGENIE3 no detectadas por MORE_naive_MLR"
+  ),
+  n_autologous = c(
+    naive_mlr_shared_dyn %>% filter(condition == "autologous") %>% nrow(),
+    naive_mlr_not_dyn %>% filter(condition == "autologous") %>% nrow(),
+    dyn_not_naive_mlr %>% filter(condition == "autologous") %>% nrow()
+  ),
+  n_monoculture = c(
+    naive_mlr_shared_dyn %>% filter(condition == "monoculture") %>% nrow(),
+    naive_mlr_not_dyn %>% filter(condition == "monoculture") %>% nrow(),
+    dyn_not_naive_mlr %>% filter(condition == "monoculture") %>% nrow()
+  )
+)
+
+comparacion_naive_mlr
+```
+```{r}
+naive_mlr_resumen_cond <- naive_mlr_not_dyn %>%
+  dplyr::select(edge, regulator, target, condition, effect) %>%
+  pivot_wider(
+    names_from = condition,
+    values_from = effect,
+    names_prefix = "effect_"
+  ) %>%
+  mutate(
+    tipo = case_when(
+      !is.na(effect_autologous) & is.na(effect_monoculture) ~ "Específica de autologous",
+      is.na(effect_autologous) & !is.na(effect_monoculture) ~ "Específica de monoculture",
+      !is.na(effect_autologous) & !is.na(effect_monoculture) &
+        sign(effect_autologous) != sign(effect_monoculture) ~ "Compartida con cambio de signo",
+      !is.na(effect_autologous) & !is.na(effect_monoculture) ~ "Compartida en ambas condiciones",
+      TRUE ~ "Sin clasificar"
+    ),
+    max_abs_effect = pmax(
+      abs(effect_autologous),
+      abs(effect_monoculture),
+      na.rm = TRUE
+    )
+  ) %>%
+  arrange(desc(max_abs_effect))
+
+naive_mlr_resumen_cond %>%
+  head(30)
+```
+
+```{r}
+genes_interes <- c(
+  "TP53", "E2F1", "E2F2", "E2F5", "MYC",
+  "NFKB", "STAT1", "RUNX1", "ETS1", "CREB1",
+  "HIF1A", "FOXO1", "CEBPA", "CEBPD",
+  "PAX5", "IRF4", "IKZF1", "PRDM1", "EBF1", "BHLHE40",
+  "HOXA10", "ARID1B"
+)
+
+candidatas_naive_mlr <- naive_mlr_resumen_cond %>%
+  filter(regulator %in% genes_interes | target %in% genes_interes) %>%
+  mutate(
+    eje_biologico = case_when(
+      regulator %in% c("NFKB", "STAT1", "RUNX1", "ETS1", "CREB1") |
+        target %in% c("NFKB", "STAT1", "RUNX1", "ETS1", "CREB1") ~
+        "Señalización inmune / citoquinas",
+
+      regulator %in% c("TP53", "E2F1", "E2F2", "E2F5", "MYC") |
+        target %in% c("TP53", "E2F1", "E2F2", "E2F5", "MYC") ~
+        "Ciclo celular / proliferación / TP53",
+
+      regulator %in% c("HIF1A", "FOXO1", "CEBPA", "CEBPD", "ARNT") |
+        target %in% c("HIF1A", "FOXO1", "CEBPA", "CEBPD", "ARNT") ~
+        "Estrés / metabolismo / hipoxia",
+
+      regulator %in% c("PAX5", "IRF4", "IKZF1", "PRDM1", "EBF1", "BHLHE40", "HOXA10", "ARID1B") |
+        target %in% c("PAX5", "IRF4", "IKZF1", "PRDM1", "EBF1", "BHLHE40", "HOXA10", "ARID1B") ~
+        "Identidad B / diferenciación / plasticidad",
+
+      TRUE ~ "Otros"
+    )
+  ) %>%
+  arrange(desc(max_abs_effect))
+
+candidatas_naive_mlr %>%
+  dplyr::select(
+    edge,
+    regulator,
+    target,
+    effect_autologous,
+    effect_monoculture,
+    tipo,
+    max_abs_effect,
+    eje_biologico
+  ) %>%
+  head(30)
+```
+
+
+```{r}
+comparacion_candidatas_mlr <- candidatas_naive_mlr %>%
+  dplyr::select(
+    edge,
+    regulator,
+    target,
+    naive_effect_autologous = effect_autologous,
+    naive_effect_monoculture = effect_monoculture,
+    naive_tipo = tipo,
+    naive_max_abs_effect = max_abs_effect,
+    naive_eje_biologico = eje_biologico
+  ) %>%
+  full_join(
+    candidatas_naive_mlr %>%
+      dplyr::select(
+        edge,
+        naive_effect_autologous = effect_autologous,
+        naive_effect_monoculture = effect_monoculture,
+        naive_tipo = tipo,
+        naive_max_abs_effect = max_abs_effect,
+        naive_eje_biologico = eje_biologico
+      ),
+    by = "edge"
+  ) %>%
+  mutate(
+    aparece_en = case_when(
+      !is.na(naive_max_abs_effect) & !is.na(naive_max_abs_effect) ~ "Naive y naive",
+      !is.na(naive_max_abs_effect) & is.na(naive_max_abs_effect) ~ "Solo naive",
+      is.na(naive_max_abs_effect) & !is.na(naive_max_abs_effect) ~ "Solo naive",
+      TRUE ~ "Sin clasificar"
+    ),
+    max_effect_global = pmax(
+      naive_max_abs_effect,
+      naive_max_abs_effect,
+      na.rm = TRUE
+    )
+  ) %>%
+  arrange(
+    factor(aparece_en, levels = c("Naive y naive", "Solo naive", "Solo naive")),
+    desc(max_effect_global)
+  )
+
+comparacion_candidatas_mlr %>%
+  head(40)
+```
+
